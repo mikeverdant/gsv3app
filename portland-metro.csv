@@ -1,4 +1,4 @@
-featured,date,start_time,event_name,venue,venue_address,venue_lat,venue_lng,venue_notes,venue_map_status,region,url
+featured,date,start_time,event_name,venue,venue_address,venue_lat,venue_lng,venue_notes,venue_map_status,region,url,category
 ,2026-04-01,10:00 AM,Cycle: The Art of John Smith,Chachalu,"Confederated Tribes, 8720 Grand Ronde Rd, Grand Ronde, OR 97347, USA",45.0617118,-123.6081586,,show,portland-metro,https://www.chachalu.org/exhibits/cycle-the-art-of-john-smith/
 ,2026-04-01,7:00 PM,Bluegrass Jam,Pizzario,"337 E Main St, Hillsboro, OR 97124, USA",45.5227372,-122.985261,,show,portland-metro,https://www.pizzariohillsboro.com/
 ,2026-04-01,7:30 PM,Apple Hunters,Artists Repertory Theatre,"1515 SW Morrison St, Portland, OR 97205, USA",45.5216901,-122.6875609,,show,portland-metro,https://artistsrep.org/performance/apple-hunters/
