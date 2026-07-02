@@ -464,6 +464,9 @@ def geocode(all_rows, cache, cmap):
         if (r.get("venue_lat") or "").strip(): continue
         h = lookup(r)
         if h: apply_coords(r, h)
+    seen_wb = {}
+    for wb in writeback: seen_wb[wb[cmap["venue"]]] = wb
+    writeback = list(seen_wb.values())
     for j in range(0, len(writeback), 200):
         w = requests.post(f"{SUPABASE_URL}/rest/v1/{CACHE_TABLE}?on_conflict={cmap['venue']}",
                           headers={**SB, "Content-Type": "application/json",
