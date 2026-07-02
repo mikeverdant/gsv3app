@@ -95,8 +95,8 @@ def _geo_tokens3(text):
             strong.add(ab)
     for m in _ABBREV_RE.finditer(t):
         if m.group(1) in STATE_BY_ABBREV: weak.add(m.group(1))
-    for m in re.finditer(r",\s*([A-Z]{2})\s+\d{5}(?:-\d{4})?\b", t):
-        if m.group(1) in STATE_BY_ABBREV: strong.add(m.group(1))   # ", VT 05403" cannot be a country code
+    for m in re.finditer(r"\b([A-Z]{2})\s+\d{5}(?:-\d{4})?\b", t):
+        if m.group(1) in STATE_BY_ABBREV: strong.add(m.group(1))   # "VT 05403" / "Newport KY 41071": state code + ZIP is unambiguous
     if re.search(r"\bd\.?\s?c\.?[\s,.!?]", low): strong.add("DC")
     if strong: countries.add("united states")
     return countries, strong, weak
@@ -464,6 +464,46 @@ def _domain(url):
     except Exception:
         return ""
 
+
+# ---------- Tier 1: coordinates published by the source itself ----------
+GEO_JSONLD_RE = re.compile(r'"latitude"\s*:\s*"?(-?\d{1,3}\.\d+)"?\s*,\s*"longitude"\s*:\s*"?(-?\d{1,3}\.\d+)"?')
+GMAPS_PB_RE = re.compile(r"google\.[a-z.]+/maps/embed\?pb=[^\"\x27]*!2d(-?\d{1,3}\.\d+)![^\"\x27]*?3d(-?\d{1,3}\.\d+)")
+GMAPS_Q_RE = re.compile(r"maps\.google\.[a-z.]+/[^\"\x27]*?[?&](?:q|ll)=(-?\d{1,3}\.\d+),(-?\d{1,3}\.\d+)")
+GMAPS_AT_RE = re.compile(r"google\.[a-z.]+/maps/[^\"\x27]*?@(-?\d{1,3}\.\d+),(-?\d{1,3}\.\d+)")
+OSM_RE = re.compile(r"openstreetmap\.org/[^\"\x27]*?mlat=(-?\d{1,3}\.\d+)&(?:amp;)?mlon=(-?\d{1,3}\.\d+)")
+
+def _valid_latlng(lat, lng):
+    try:
+        lat, lng = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180): return None
+    if abs(lat) < 0.01 and abs(lng) < 0.01: return None   # null island
+    return lat, lng
+
+def _coords_from_page(html):
+    """Extract coordinates the source itself published. Trust order:
+    schema.org GeoCoordinates in JSON-LD, then Google Maps embeds, then OSM embeds.
+    JSON-LD is lat,lng; the Google pb format is !2d=LNG !3d=LAT (swapped)."""
+    m = GEO_JSONLD_RE.search(html)
+    if m:
+        v = _valid_latlng(m.group(1), m.group(2))
+        if v: return v
+    m = GMAPS_PB_RE.search(html)
+    if m:
+        v = _valid_latlng(m.group(2), m.group(1))   # pb: 2d is longitude, 3d is latitude
+        if v: return v
+    for rx in (GMAPS_Q_RE, GMAPS_AT_RE, OSM_RE):
+        m = rx.search(html)
+        if m:
+            v = _valid_latlng(m.group(1), m.group(2))
+            if v: return v
+    return None
+
+def _locality_from_jsonld(html):
+    m = re.search(r'"addressLocality"\s*:\s*"([^"]{2,60})"', html)
+    return m.group(1).strip() if m else ""
+
 def _addr_from_jsonld(html):
     """STRICT: build an address only from schema.org structured location data.
     Returns (venue_name, address_string) or ('','')."""
@@ -521,32 +561,49 @@ def verify_unpinnable(all_rows):
     if not candidates:
         print("Verification: no unpinnable rows with URLs."); return
 
+    def apply_found(r, found):
+        vname, vaddr, lat, lng, city = (found + ["", "", "", "", ""])[:5]
+        applied = False
+        if lat and lng and _valid_latlng(lat, lng):
+            guard_text = " ".join(x for x in [r.get("venue_address"), vaddr] if x)
+            if not coords_contradict_text(lat, lng, guard_text):
+                r["venue_lat"], r["venue_lng"] = str(lat), str(lng)
+                r["venue_map_status"] = "show"
+                if city and not (r.get("region") or "").strip(): r["region"] = city
+                applied = True
+        if vaddr and not applied:
+            r["venue_address"] = vaddr; applied = True
+        if vaddr and not (r.get("venue_address") or "").strip(): r["venue_address"] = vaddr
+        if vname and not (r.get("venue") or "").strip(): r["venue"] = vname
+        return applied
+
     fetched, recovered = 0, 0
     for r, url in candidates:
         if url in verified_map:
-            vname, vaddr = verified_map[url]
-            if vaddr:
-                r["venue_address"] = vaddr
-                if not (r.get("venue") or "").strip() and vname: r["venue"] = vname
-                recovered += 1
+            if apply_found(r, list(verified_map[url])): recovered += 1
             continue
         if url in fails or fetched >= VERIFY_CAP: continue
         fetched += 1
-        vname, vaddr = "", ""
+        found = None
         html = _fetch_page(url)
+        pages = [html] if html else []
         if html:
-            vname, vaddr = _addr_from_jsonld(html)
-            if not vaddr:
-                links = [h for h in HREF_RE.findall(html) if any(td in h.lower() for td in TICKET_DOMAINS)]
-                if links:
-                    thtml = _fetch_page(urljoin(url, links[0]))
-                    if thtml: vname, vaddr = _addr_from_jsonld(thtml)
+            links = [h for h in HREF_RE.findall(html) if any(td in h.lower() for td in TICKET_DOMAINS)]
+            if links:
+                thtml = _fetch_page(urljoin(url, links[0]))
+                if thtml: pages.append(thtml)
+        for pg in pages:
+            vname, vaddr = _addr_from_jsonld(pg)
+            coords = _coords_from_page(pg)
+            city = _locality_from_jsonld(pg)
+            if coords or vaddr:
+                lat, lng = coords if coords else ("", "")
+                found = [vname, vaddr, str(lat), str(lng), city]
+                break
         time.sleep(RESCUE_DELAY)
-        if vaddr:
-            verified_map[url] = [vname, vaddr]
-            r["venue_address"] = vaddr
-            if not (r.get("venue") or "").strip() and vname: r["venue"] = vname
-            recovered += 1
+        if found:
+            verified_map[url] = found
+            if apply_found(r, found): recovered += 1
         else:
             fails.add(url)
     _save_json_map("verified_locations.json", verified_map)
