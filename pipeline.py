@@ -696,7 +696,7 @@ def apply_coords(r, hit):
     if not (r.get("region") or "").strip() and hit["city"]: r["region"] = hit["city"]
     r["venue_map_status"] = "show"
 
-FAILURES_NAME = "geocode_failures_v2.json"
+FAILURES_NAME = "geocode_failures_v3.json"
 
 def load_failures():
     r = requests.get(f"{SUPABASE_URL}/storage/v1/object/{IMPORTS_BUCKET}/{FAILURES_NAME}", headers=SB)
@@ -777,45 +777,64 @@ def geocode(all_rows, cache, cmap):
     print(f"Cache hits: {hits}. To geocode: {len(uniq)} (running {len(todo)}, "
           f"skipping {skipped_failed} known-failed, {no_addr} rows lack an address -> unmapped).")
 
+    def liq(q):
+        g = requests.get("https://us1.locationiq.com/v1/search",
+                         params={"key": LOCATIONIQ_KEY, "q": q[:250], "format": "json",
+                                 "limit": 1, "addressdetails": 1}, timeout=15)
+        if g.status_code == 429:
+            time.sleep(2.5)
+            g = requests.get("https://us1.locationiq.com/v1/search",
+                             params={"key": LOCATIONIQ_KEY, "q": q[:250], "format": "json",
+                                     "limit": 1, "addressdetails": 1}, timeout=15)
+        return g
+
+    def entry_of(g):
+        if g.status_code != 200 or not g.json(): return None
+        top = g.json()[0]; a = top.get("address", {})
+        city = a.get("city") or a.get("town") or a.get("village") or a.get("suburb") or ""
+        return {"lat": top["lat"], "lng": top["lon"], "city": city,
+                "state": a.get("state",""), "country": a.get("country","")}, top, a
+
     geocoded, failed, rejected, writeback = 0, 0, 0, []
     new_failed = set()
     for k, r in todo:
-        addr = r.get("venue_address") or ""
-        q = ", ".join(x for x in [r.get("venue"), addr] if (x or "").strip())
+        addr = (r.get("venue_address") or "").strip()
+        venue = (r.get("venue") or "").strip()
+        queries = []
+        if venue and addr: queries.append(f"{venue}, {addr}")
+        if addr: queries.append(addr)   # address alone: geocoders are best at this
+        accepted, last_status, saw_reject = None, None, False
         try:
-            g = requests.get("https://us1.locationiq.com/v1/search",
-                             params={"key": LOCATIONIQ_KEY, "q": q, "format": "json",
-                                     "limit": 1, "addressdetails": 1}, timeout=15)
-            if g.status_code == 429:
-                time.sleep(2.5)
-                g = requests.get("https://us1.locationiq.com/v1/search",
-                                 params={"key": LOCATIONIQ_KEY, "q": q, "format": "json",
-                                         "limit": 1, "addressdetails": 1}, timeout=15)
-            if g.status_code == 200 and g.json():
-                top = g.json()[0]; a = top.get("address", {})
-                city = a.get("city") or a.get("town") or a.get("village") or a.get("suburb") or ""
-                e = {"lat": top["lat"], "lng": top["lon"], "city": city,
-                     "state": a.get("state",""), "country": a.get("country","")}
-                if not entry_matches_text(e, addr) or coords_contradict_text(e["lat"], e["lng"], addr):
-                    rejected += 1; new_failed.add(k)   # result contradicts the record's own location
-                    continue
+            for q in queries:
+                g = liq(q); last_status = g.status_code
+                res = entry_of(g)
+                time.sleep(1.1)
+                if not res: continue
+                e, top, a = res
+                if entry_matches_text(e, addr) and not coords_contradict_text(e["lat"], e["lng"], addr):
+                    accepted = (e, top, a); break
+                saw_reject = True
+            if accepted:
+                e, top, a = accepted
                 v2[k] = e; cache[k] = e
-                wb = {cmap["venue"]: r.get("venue"), cmap["lat"]: float(top["lat"]), cmap["lng"]: float(top["lon"])}
+                wb = {cmap["venue"]: venue, cmap["lat"]: float(top["lat"]), cmap["lng"]: float(top["lon"])}
                 if cmap["addr"]: wb[cmap["addr"]] = addr
-                if cmap["city"]: wb[cmap["city"]] = city
+                if cmap["city"]: wb[cmap["city"]] = e["city"]
                 if cmap["state"]: wb[cmap["state"]] = a.get("state","")
                 if cmap["country"]: wb[cmap["country"]] = a.get("country","")
                 writeback.append(wb); geocoded += 1
+            elif saw_reject:
+                rejected += 1; new_failed.add(k)
             else:
                 if failed == 0:
-                    print(f"  First geocode failure: HTTP {g.status_code} {g.text[:150]}")
+                    print(f"  First geocode failure: HTTP {last_status}")
                 failed += 1
-                if g.status_code == 404: new_failed.add(k)   # only "cannot geocode" is permanent; 429/5xx retry next run
+                if last_status == 404: new_failed.add(k)
         except Exception as ex:
             if failed == 0:
                 print(f"  First geocode failure: {ex}")
             failed += 1
-        time.sleep(1.1)
+            time.sleep(1.1)
 
     for r in all_rows:
         if (r.get("venue_lat") or "").strip(): continue
