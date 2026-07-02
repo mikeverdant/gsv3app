@@ -1,0 +1,30 @@
+name: Daily events pipeline
+
+on:
+  schedule:
+    - cron: "0 14 * * *"   # 14:00 UTC = 6am PST / 7am PDT, daily
+  workflow_dispatch: {}      # manual "Run workflow" button
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-pipeline
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Run pipeline
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          LOCATIONIQ_KEY: ${{ secrets.LOCATIONIQ_KEY }}
+        run: python pipeline.py
