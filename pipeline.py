@@ -84,32 +84,101 @@ def _get(rec, *names):
         if v not in (None, "", [], {}): return v
     return ""
 
-LABEL_RE = re.compile(r"^(Performers|Event Dates|Date & Time|Price|Venue|Location|Contact Information|Description|Genres|Source URL)\s*:\s*(.*)$", re.I | re.M)
+LABELS = ("Performers", "Event Dates", "Date & Time", "Price", "Venue", "Location",
+          "Contact Information", "Description", "Genres", "Source URL")
+LABEL_RE = re.compile(
+    r"^(" + "|".join(re.escape(l) for l in LABELS) + r")\s*:[ \t]*\n?((?:.+\n?)*?)(?=\n\s*\n|^(?:" + "|".join(re.escape(l) for l in LABELS) + r")\s*:|\Z)",
+    re.I | re.M)
+ANY_LABEL_RE = re.compile(r"^(?:" + "|".join(re.escape(l) for l in LABELS) + r")\s*:", re.I | re.M)
 
 def _labels_from_text(text):
     out = {}
     if not isinstance(text, str): return out
     for m in LABEL_RE.finditer(text):
         key = re.sub(r"[^a-z]", "", m.group(1).lower())
-        val = m.group(2).strip()
+        val = re.sub(r"\s+", " ", m.group(2)).strip()
         if val and val.lower() not in ("not provided in source.", "not provided in source"):
             out[key] = val
     return out
 
-def _parse_date(val):
-    """Return (YYYY-MM-DD, HH:MM) from ISO-ish values; ('','') if unusable."""
-    if isinstance(val, list) and val: val = val[0]
-    if isinstance(val, dict):
-        val = val.get("start") or val.get("date") or ""
-    s = str(val or "").strip()
-    m = re.search(r"(\d{4})-(\d{2})-(\d{2})[T ]?(\d{2}):(\d{2})?", s)
+MONTHS = {m.lower(): i for i, m in enumerate(
+    ["January","February","March","April","May","June","July","August",
+     "September","October","November","December"], 1)}
+MONTHS.update({m[:3].lower(): i for m, i in [(k.capitalize(), v) for k, v in MONTHS.items()]})
+_MON = r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+DATE_PATTERNS = [
+    re.compile(r"(\d{4})-(\d{2})-(\d{2})"),                                    # ISO
+    re.compile(_MON + r"\.?\s+(\d{1,2})(?!\d)(?:st|nd|rd|th)?(?:\s*[-–]\s*\d{1,2})?(?:\s*,?\s*(\d{4}))?", re.I),  # July 1, 2026 / July 14-16
+    re.compile(r"(?<!\d)(\d{1,2})(?:st|nd|rd|th)?\s+" + _MON + r"\.?(?:\s*,?\s*(\d{4}))?", re.I),                  # 1 July 2026
+]
+TIME_RE = re.compile(r"\b(\d{1,2}):(\d{2})\s*([ap])\.?m?\.?\b|\b(\d{1,2})\s*([ap])\.?m\.?\b|\b([01]?\d|2[0-3]):([0-5]\d)\b", re.I)
+
+def _plausible(y, mo, d):
+    try:
+        dt = date(y, mo, d)
+    except ValueError:
+        return None
+    today = date.today()
+    if (dt - today).days < -1 or (dt - today).days > 1100: return None
+    return dt.isoformat()
+
+def _pick_year(mo, d):
+    today = date.today()
+    for y in (today.year, today.year + 1):
+        iso = _plausible(y, mo, d)
+        if iso: return iso
+    return None
+
+def _human_date(text):
+    if not text: return ""
+    s = str(text)
+    m = DATE_PATTERNS[0].search(s)
     if m:
-        d = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-        t = f"{m.group(4)}:{m.group(5) or '00'}"
-        return d, ("" if t == "00:00" else t)
+        return _plausible(int(m.group(1)), int(m.group(2)), int(m.group(3))) or ""
+    m = DATE_PATTERNS[1].search(s)
+    if m:
+        mo = MONTHS.get(m.group(1)[:3].lower()); d = int(m.group(2)); y = m.group(3)
+        if mo: return (_plausible(int(y), mo, d) if y else _pick_year(mo, d)) or ""
+    m = DATE_PATTERNS[2].search(s)
+    if m:
+        d = int(m.group(1)); mo = MONTHS.get(m.group(2)[:3].lower()); y = m.group(3)
+        if mo: return (_plausible(int(y), mo, d) if y else _pick_year(mo, d)) or ""
+    return ""
+
+def _human_time(text):
+    if not text: return ""
+    m = TIME_RE.search(str(text))
+    if not m: return ""
+    if m.group(1):
+        hh, mm, ap = int(m.group(1)), int(m.group(2)), m.group(3).lower()
+        if ap == "p" and hh < 12: hh += 12
+        if ap == "a" and hh == 12: hh = 0
+    elif m.group(4):
+        hh, mm, ap = int(m.group(4)), 0, m.group(5).lower()
+        if ap == "p" and hh < 12: hh += 12
+        if ap == "a" and hh == 12: hh = 0
+    else:
+        hh, mm = int(m.group(6)), int(m.group(7))
+    if hh > 23 or mm > 59: return ""
+    return f"{hh:02d}:{mm:02d}"
+
+def _parse_date(val):
+    """Return (YYYY-MM-DD, HH:MM) from ISO-ish STRING values only.
+    Numeric epoch values are ignored on purpose: the export's epoch field is the
+    scrape timestamp, not the event date, and a wrong date is worse than no date."""
+    if isinstance(val, list) and val: val = val[0]
+    if isinstance(val, dict): val = val.get("start") or val.get("date") or ""
+    if isinstance(val, (int, float)): return "", ""
+    s = str(val or "").strip()
+    if re.fullmatch(r"\d{10,16}", s): return "", ""
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})", s)
+    if m:
+        iso = _plausible(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        t = f"{m.group(4)}:{m.group(5)}"
+        return (iso or ""), ("" if not iso or t == "00:00" else t)
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
-        return m.group(0), ""
+        return (_plausible(int(m.group(1)), int(m.group(2)), int(m.group(3))) or ""), ""
     return "", ""
 
 def parse_import_records(lines):
@@ -128,14 +197,15 @@ def parse_import_records(lines):
         name = str(_get(rec, "event_name", "event_title", "name", "title", "event") or "").strip()
         d, t = _parse_date(_get(rec, "event_dates", "date", "start_date", "start", "datetime"))
         if not d:
-            d2, t2 = _parse_date(labels.get("eventdates", ""))
-            d, t = d or d2, t or t2
+            src = labels.get("datetime") or labels.get("eventdates") or ""
+            d = _human_date(src)
+            t = t or _human_time(src)
         venue = str(_get(rec, "venue", "venue_name") or labels.get("venue", "")).strip()
         addr = str(_get(rec, "venue_address", "address", "location") or labels.get("location", "")).strip()
         url = str(_get(rec, "url", "source_url", "link") or labels.get("sourceurl", "")).strip()
         price = str(_get(rec, "price") or labels.get("price", "")).strip()
         raw_desc = str(_get(rec, "description") or "").strip()
-        desc = labels.get("description", "").strip() or ("" if LABEL_RE.search(raw_desc) else raw_desc)
+        desc = labels.get("description", "").strip() or ("" if ANY_LABEL_RE.search(raw_desc) else raw_desc)
         genres = str(_get(rec, "genres", "genre") or labels.get("genres", "")).strip()
         cat = str(_get(rec, "category") or "").strip() or infer_category(name, venue, genres, desc)
         stime = str(_get(rec, "start_time", "time") or "").strip() or t
@@ -281,8 +351,12 @@ def geocode(all_rows, cache, cmap):
                 if cmap["country"]: wb[cmap["country"]] = a.get("country","")
                 writeback.append(wb); geocoded += 1
             else:
+                if failed == 0:
+                    print(f"  First geocode failure: HTTP {g.status_code} {g.text[:150]}")
                 failed += 1
-        except Exception:
+        except Exception as ex:
+            if failed == 0:
+                print(f"  First geocode failure: {ex}")
             failed += 1
         time.sleep(0.6)
     for r in all_rows:
