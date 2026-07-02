@@ -124,8 +124,8 @@ def parse_import_records(lines):
         if not isinstance(rec, dict):
             quarantine.append({"reason": "not an object", "raw": str(rec)[:300]}); continue
 
-        labels = _labels_from_text(_get(rec, "claim", "text", "content", "body"))
-        name = str(_get(rec, "event_name", "name", "title", "event") or "").strip()
+        labels = _labels_from_text(_get(rec, "claim", "text", "content", "body", "description"))
+        name = str(_get(rec, "event_name", "event_title", "name", "title", "event") or "").strip()
         d, t = _parse_date(_get(rec, "event_dates", "date", "start_date", "start", "datetime"))
         if not d:
             d2, t2 = _parse_date(labels.get("eventdates", ""))
@@ -134,7 +134,8 @@ def parse_import_records(lines):
         addr = str(_get(rec, "venue_address", "address", "location") or labels.get("location", "")).strip()
         url = str(_get(rec, "url", "source_url", "link") or labels.get("sourceurl", "")).strip()
         price = str(_get(rec, "price") or labels.get("price", "")).strip()
-        desc = str(_get(rec, "description") or labels.get("description", "")).strip()
+        raw_desc = str(_get(rec, "description") or "").strip()
+        desc = labels.get("description", "").strip() or ("" if LABEL_RE.search(raw_desc) else raw_desc)
         genres = str(_get(rec, "genres", "genre") or labels.get("genres", "")).strip()
         cat = str(_get(rec, "category") or "").strip() or infer_category(name, venue, genres, desc)
         stime = str(_get(rec, "start_time", "time") or "").strip() or t
