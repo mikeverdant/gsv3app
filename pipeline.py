@@ -75,6 +75,82 @@ def infer_category(name, venue, genres, description):
         if any(k in text for k in kws): return cat
     return "Event"
 
+
+# ---------- URL rescue for date-quarantined records ----------
+URL_DATES_NAME = "url_dates.json"
+URL_FAILS_NAME = "url_rescue_failures.json"
+RESCUE_CAP = 250          # max page fetches per run
+RESCUE_DELAY = 0.5
+
+JSONLD_RE = re.compile(r'"startDate"\s*:\s*"([^"]+)"')
+TIMEATTR_RE = re.compile(r'<time[^>]+datetime="([^"]+)"', re.I)
+META_RE = re.compile(r'<meta[^>]+(?:property|itemprop|name)="[^"]*(?:start_?[Dd]ate|start_?time)[^"]*"[^>]+content="([^"]+)"', re.I)
+
+def _load_json_map(name, default):
+    r = requests.get(f"{SUPABASE_URL}/storage/v1/object/{IMPORTS_BUCKET}/{name}", headers=SB)
+    if r.status_code != 200: return default
+    try: return json.loads(r.content)
+    except Exception: return default
+
+def _save_json_map(name, obj):
+    requests.post(f"{SUPABASE_URL}/storage/v1/object/{IMPORTS_BUCKET}/{name}",
+                  headers={**SB, "Content-Type": "application/json", "x-upsert": "true"},
+                  data=json.dumps(obj))
+
+def _date_from_page(html):
+    for rx in (JSONLD_RE, TIMEATTR_RE, META_RE):
+        for m in rx.finditer(html):
+            d, t = _parse_date(m.group(1))
+            if d: return d, t
+    return "", ""
+
+def rescue_by_url(quarantine):
+    """Try to recover date-missing records by reading their source pages."""
+    candidates = []
+    for q in quarantine:
+        if not q["reason"].startswith("missing date"): continue
+        try: rec = json.loads(q["raw_full"])
+        except Exception: continue
+        url = str(_get(rec, "url", "source_url", "link") or "").strip()
+        if url.startswith("http"): candidates.append((q, rec, url))
+    if not candidates: return [], quarantine
+
+    url_dates = _load_json_map(URL_DATES_NAME, {})
+    url_fails = set() if date.today().weekday() == 0 else set(_load_json_map(URL_FAILS_NAME, []))
+    rescued_rows, still_quarantined, fetched = [], [], 0
+    handled = set()
+
+    for q, rec, url in candidates:
+        handled.add(id(q))
+        d, t = "", ""
+        if url in url_dates:
+            d, t = url_dates[url]
+        elif url in url_fails or fetched >= RESCUE_CAP:
+            still_quarantined.append(q); continue
+        else:
+            fetched += 1
+            try:
+                pg = requests.get(url, timeout=10,
+                                  headers={"User-Agent": "Mozilla/5.0 (GSV3 event pipeline)"})
+                if pg.status_code == 200:
+                    d, t = _date_from_page(pg.text[:400000])
+            except Exception:
+                pass
+            time.sleep(RESCUE_DELAY)
+            if d: url_dates[url] = [d, t]
+            else: url_fails.add(url)
+        if not d:
+            still_quarantined.append(q); continue
+        row = _record_to_row(rec, d, t)
+        if row: rescued_rows.append(row)
+        else: still_quarantined.append(q)
+
+    remaining = [q for q in quarantine if id(q) not in handled] + still_quarantined
+    _save_json_map(URL_DATES_NAME, url_dates)
+    _save_json_map(URL_FAILS_NAME, sorted(url_fails))
+    print(f"URL rescue: {len(rescued_rows)} recovered ({fetched} pages fetched), {len(remaining)} still quarantined.")
+    return rescued_rows, remaining
+
 # ---------- raw record parsing ----------
 def _get(rec, *names):
     """Case/format-tolerant field lookup on a raw record dict."""
@@ -181,6 +257,26 @@ def _parse_date(val):
         return (_plausible(int(m.group(1)), int(m.group(2)), int(m.group(3))) or ""), ""
     return "", ""
 
+
+def _record_to_row(rec, d, t):
+    labels = _labels_from_text(_get(rec, "claim", "text", "content", "body", "description"))
+    name = str(_get(rec, "event_name", "event_title", "name", "title", "event") or "").strip()
+    if not name or not d: return None
+    venue = str(_get(rec, "venue", "venue_name") or labels.get("venue", "")).strip()
+    addr = str(_get(rec, "venue_address", "address", "location") or labels.get("location", "")).strip()
+    url = str(_get(rec, "url", "source_url", "link") or labels.get("sourceurl", "")).strip()
+    price = str(_get(rec, "price") or labels.get("price", "")).strip()
+    raw_desc = str(_get(rec, "description") or "").strip()
+    desc = labels.get("description", "").strip() or ("" if ANY_LABEL_RE.search(raw_desc) else raw_desc)
+    genres = str(_get(rec, "genres", "genre") or labels.get("genres", "")).strip()
+    cat = str(_get(rec, "category") or "").strip() or infer_category(name, venue, genres, desc)
+    stime = str(_get(rec, "start_time", "time") or "").strip() or t
+    row = blank_row()
+    row.update({"date": d, "start_time": stime, "event_name": name, "venue": venue,
+                "venue_address": addr, "url": url, "category": cat,
+                "price": price, "description": desc})
+    return row
+
 def parse_import_records(lines):
     rows, quarantine = [], []
     for ln in lines:
@@ -189,37 +285,23 @@ def parse_import_records(lines):
         try:
             rec = json.loads(ln)
         except Exception:
-            quarantine.append({"reason": "bad json", "raw": ln[:300]}); continue
+            quarantine.append({"reason": "bad json", "raw": ln[:300], "raw_full": ""}); continue
         if not isinstance(rec, dict):
-            quarantine.append({"reason": "not an object", "raw": str(rec)[:300]}); continue
-
+            quarantine.append({"reason": "not an object", "raw": str(rec)[:300], "raw_full": ""}); continue
         labels = _labels_from_text(_get(rec, "claim", "text", "content", "body", "description"))
         name = str(_get(rec, "event_name", "event_title", "name", "title", "event") or "").strip()
         d, t = _parse_date(_get(rec, "event_dates", "date", "start_date", "start", "datetime"))
         if not d:
-            src = labels.get("datetime") or labels.get("eventdates") or ""
-            d = _human_date(src)
-            t = t or _human_time(src)
-        venue = str(_get(rec, "venue", "venue_name") or labels.get("venue", "")).strip()
-        addr = str(_get(rec, "venue_address", "address", "location") or labels.get("location", "")).strip()
-        url = str(_get(rec, "url", "source_url", "link") or labels.get("sourceurl", "")).strip()
-        price = str(_get(rec, "price") or labels.get("price", "")).strip()
-        raw_desc = str(_get(rec, "description") or "").strip()
-        desc = labels.get("description", "").strip() or ("" if ANY_LABEL_RE.search(raw_desc) else raw_desc)
-        genres = str(_get(rec, "genres", "genre") or labels.get("genres", "")).strip()
-        cat = str(_get(rec, "category") or "").strip() or infer_category(name, venue, genres, desc)
-        stime = str(_get(rec, "start_time", "time") or "").strip() or t
-
-        if not name or not d:
+            srcv = labels.get("datetime") or labels.get("eventdates") or ""
+            d = _human_date(srcv)
+            t = t or _human_time(srcv)
+        row = _record_to_row(rec, d, t) if (name and d) else None
+        if row:
+            rows.append(row)
+        else:
+            full = json.dumps(rec, default=str)
             quarantine.append({"reason": f"missing {'name' if not name else 'date'}",
-                               "raw": json.dumps(rec, default=str)[:300]})
-            continue
-        # If the address is just a city name, keep it but don't fake a street address.
-        row = blank_row()
-        row.update({"date": d, "start_time": stime, "event_name": name, "venue": venue,
-                    "venue_address": addr, "url": url, "category": cat,
-                    "price": price, "description": desc})
-        rows.append(row)
+                               "raw": full[:300], "raw_full": full})
     return rows, quarantine
 
 # ---------- steps ----------
@@ -234,10 +316,12 @@ def fetch_import():
     except OSError:
         pass  # already plain text
     rows, quarantine = parse_import_records(data.decode("utf-8", errors="replace").splitlines())
-    print(f"Import: {len(rows)} events parsed, {len(quarantine)} quarantined.")
+    print(f"Import: {len(rows)} events parsed, {len(quarantine)} quarantined before rescue.")
+    rescued, quarantine = rescue_by_url(quarantine)
+    rows.extend(rescued)
     if quarantine:
         buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=["reason", "raw"]); w.writeheader(); w.writerows(quarantine)
+        w = csv.DictWriter(buf, fieldnames=["reason", "raw"], extrasaction="ignore"); w.writeheader(); w.writerows(quarantine)
         requests.post(f"{SUPABASE_URL}/storage/v1/object/{IMPORTS_BUCKET}/quarantine.csv",
                       headers={**SB, "Content-Type": "text/csv", "x-upsert": "true"},
                       data=buf.getvalue().encode())
