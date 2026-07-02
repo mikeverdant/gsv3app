@@ -4,7 +4,7 @@ Flow: pull imports/latest.ndjson.gz (Supabase) -> parse -> merge with GitHub CSV
 Secrets come from environment variables (GitHub Actions secrets vault).
 """
 import os, sys, json, csv, io, re, time, base64, gzip, unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import requests
 
 # ---------- config ----------
@@ -317,6 +317,19 @@ def apply_coords(r, hit):
     if not (r.get("region") or "").strip() and hit["city"]: r["region"] = hit["city"]
     r["venue_map_status"] = "show"
 
+FAILURES_NAME = "geocode_failures.json"
+
+def load_failures():
+    r = requests.get(f"{SUPABASE_URL}/storage/v1/object/{IMPORTS_BUCKET}/{FAILURES_NAME}", headers=SB)
+    if r.status_code != 200: return set()
+    try: return set(json.loads(r.content))
+    except Exception: return set()
+
+def save_failures(keys):
+    requests.post(f"{SUPABASE_URL}/storage/v1/object/{IMPORTS_BUCKET}/{FAILURES_NAME}",
+                  headers={**SB, "Content-Type": "application/json", "x-upsert": "true"},
+                  data=json.dumps(sorted(keys)))
+
 def geocode(all_rows, cache, cmap):
     lookup = lambda r: cache.get(venue_key(r.get("venue"), r.get("venue_address"))) or cache.get(venue_key(r.get("venue")))
     hits = 0
@@ -329,9 +342,13 @@ def geocode(all_rows, cache, cmap):
         if (r.get("venue_lat") or "").strip(): continue
         if (r.get("venue") or "").strip():
             uniq.setdefault(venue_key(r.get("venue"), r.get("venue_address")), r)
-    todo = list(uniq.items())[:DAILY_GEOCODE_LIMIT]
-    print(f"Cache hits: {hits}. New venues to geocode: {len(uniq)} (running {len(todo)}).")
+    known_failed = set() if date.today().weekday() == 0 else load_failures()
+    skipped_failed = sum(1 for k in uniq if k in known_failed)
+    todo = [(k, r) for k, r in uniq.items() if k not in known_failed][:DAILY_GEOCODE_LIMIT]
+    print(f"Cache hits: {hits}. New venues to geocode: {len(uniq)} "
+          f"(running {len(todo)}, skipping {skipped_failed} known-unresolvable; weekly retry on Mondays).")
     geocoded, failed, writeback = 0, 0, []
+    new_failed = set()
     for k, r in todo:
         q = ", ".join(x for x in [r.get("venue"), r.get("venue_address")] if (x or "").strip())
         try:
@@ -353,7 +370,7 @@ def geocode(all_rows, cache, cmap):
             else:
                 if failed == 0:
                     print(f"  First geocode failure: HTTP {g.status_code} {g.text[:150]}")
-                failed += 1
+                failed += 1; new_failed.add(k)
         except Exception as ex:
             if failed == 0:
                 print(f"  First geocode failure: {ex}")
@@ -364,10 +381,13 @@ def geocode(all_rows, cache, cmap):
         h = lookup(r)
         if h: apply_coords(r, h)
     for j in range(0, len(writeback), 200):
-        w = requests.post(f"{SUPABASE_URL}/rest/v1/{CACHE_TABLE}",
-                          headers={**SB, "Content-Type": "application/json", "Prefer": "return=minimal"},
+        w = requests.post(f"{SUPABASE_URL}/rest/v1/{CACHE_TABLE}?on_conflict={cmap['venue']}",
+                          headers={**SB, "Content-Type": "application/json",
+                                   "Prefer": "return=minimal,resolution=merge-duplicates"},
                           data=json.dumps(writeback[j:j+200]))
         if w.status_code >= 300: print(f"Cache write-back warning ({w.status_code}): {w.text[:200]}")
+    if new_failed or known_failed:
+        save_failures(known_failed | new_failed)
     print(f"Geocoded {geocoded} new venues (failed: {failed}).")
     return geocoded, failed
 
@@ -392,7 +412,7 @@ def push_csv(all_rows, sha):
     w = csv.DictWriter(buf, fieldnames=APP_COLUMNS, extrasaction="ignore")
     w.writeheader()
     for r in all_rows: w.writerow({c: (r.get(c) or "") for c in APP_COLUMNS})
-    body = {"message": f"daily pipeline: {len(all_rows)} events ({datetime.utcnow().isoformat()}Z)",
+    body = {"message": f"daily pipeline: {len(all_rows)} events ({datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")}Z)",
             "content": base64.b64encode(buf.getvalue().encode()).decode(),
             "sha": sha, "branch": GITHUB_BRANCH}
     p = requests.put(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_CSV_PATH}",
