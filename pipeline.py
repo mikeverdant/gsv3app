@@ -76,42 +76,104 @@ US_STATES = {
 STATE_BY_ABBREV = {v: k for k, v in US_STATES.items()}
 _ABBREV_RE = re.compile(r",\s*([A-Z]{2})\b")
 
-def geo_tokens(text):
-    """Extract explicit country / US-state mentions from free text."""
+STREET_SUFFIX = r"(?:av(?:e(?:nue)?)?|st(?:reet)?|blvd|boulevard|r(?:oa)?d|dr(?:ive)?|way|lane|ln|place|pl|court|ct|hwy|highway|pkwy|parkway|cir(?:cle)?|ter(?:race)?)"
+
+def _geo_tokens3(text):
+    """Returns (countries, strong_states, weak_states).
+    strong = full state name; weak = 2-letter abbrev (can collide with country codes)."""
     t = " " + re.sub(r"\s+", " ", str(text or "")).strip() + " "
     low = t.lower()
-    countries, states = set(), set()
+    countries, strong, weak = set(), set(), set()
     for alias, canon in COUNTRY_ALIASES.items():
         if len(alias) <= 3:
             if re.search(r"[,\s]" + re.escape(alias) + r"[\s,.!?]", low): countries.add(canon)
         elif f" {alias} " in low or f" {alias}," in low or f" {alias}." in low or low.rstrip().endswith(" " + alias):
             countries.add(canon)
     for name, ab in US_STATES.items():
-        if re.search(r"\b" + re.escape(name) + r"\b", low): states.add(ab)
+        # a state name immediately followed by a street suffix is a street, not a state
+        if re.search(r"\b" + re.escape(name) + r"\b(?!\s+" + STREET_SUFFIX + r"\b)", low):
+            strong.add(ab)
     for m in _ABBREV_RE.finditer(t):
-        if m.group(1) in STATE_BY_ABBREV: states.add(m.group(1))
-    if states: countries.add("united states")
-    return countries, states
+        if m.group(1) in STATE_BY_ABBREV: weak.add(m.group(1))
+    if re.search(r"\bd\.?\s?c\.?[\s,.!?]", low): strong.add("DC")
+    if strong: countries.add("united states")
+    return countries, strong, weak
+
+def geo_tokens(text):
+    c, s, w = _geo_tokens3(text)
+    return c, (s | w)
 
 def entry_matches_text(entry, text):
     """True if a geocode entry (country/state) is consistent with location text.
-    Empty text or no recognizable tokens = cannot judge = treated as consistent."""
-    countries, states = geo_tokens(text)
-    if not countries and not states: return True
+    No recognizable tokens = cannot judge = treated as consistent."""
+    countries, strong, weak = _geo_tokens3(text)
+    states = strong | weak
     ec = str(entry.get("country") or "").lower().strip()
     ec = COUNTRY_ALIASES.get(ec, ec)
     es = str(entry.get("state") or "").strip()
     es_ab = US_STATES.get(es.lower(), es.upper() if len(es) == 2 else "")
     if countries and ec and ec not in countries: return False
     if states:
-        if ec and ec != "united states": return False
+        if ec and ec != "united states":
+            return not strong   # only a full state name outvotes a foreign entry; ', DE' codes don't
         if es_ab and es_ab not in states: return False
     return True
+
+# Conservative US state bounding boxes (lat_min, lat_max, lon_min, lon_max)
+STATE_BBOX = {
+ "AL":(30.1,35.1,-88.5,-84.9),"AK":(51.2,71.4,-179.2,-129.9),"AZ":(31.3,37.1,-114.9,-109.0),
+ "AR":(33.0,36.5,-94.7,-89.6),"CA":(32.5,42.1,-124.5,-114.1),"CO":(36.9,41.1,-109.1,-102.0),
+ "CT":(40.9,42.1,-73.8,-71.7),"DE":(38.4,39.9,-75.8,-75.0),"FL":(24.4,31.1,-87.7,-79.9),
+ "GA":(30.3,35.1,-85.7,-80.8),"HI":(18.9,22.3,-160.3,-154.8),"ID":(41.9,49.1,-117.3,-111.0),
+ "IL":(36.9,42.6,-91.6,-87.0),"IN":(37.7,41.8,-88.2,-84.7),"IA":(40.3,43.6,-96.7,-90.1),
+ "KS":(36.9,40.1,-102.1,-94.6),"KY":(36.4,39.2,-89.6,-81.9),"LA":(28.9,33.1,-94.1,-88.8),
+ "ME":(43.0,47.5,-71.1,-66.9),"MD":(37.9,39.8,-79.5,-75.0),"MA":(41.2,42.9,-73.6,-69.9),
+ "MI":(41.6,48.3,-90.5,-82.1),"MN":(43.4,49.4,-97.3,-89.5),"MS":(30.1,35.1,-91.7,-88.0),
+ "MO":(35.9,40.7,-95.8,-89.1),"MT":(44.3,49.1,-116.1,-104.0),"NE":(39.9,43.1,-104.1,-95.3),
+ "NV":(35.0,42.1,-120.1,-114.0),"NH":(42.6,45.4,-72.6,-70.6),"NJ":(38.9,41.4,-75.6,-73.9),
+ "NM":(31.3,37.1,-109.1,-103.0),"NY":(40.4,45.1,-79.8,-71.8),"NC":(33.8,36.6,-84.4,-75.4),
+ "ND":(45.9,49.1,-104.1,-96.5),"OH":(38.4,42.0,-84.9,-80.5),"OK":(33.6,37.1,-103.1,-94.4),
+ "OR":(41.9,46.3,-124.7,-116.4),"PA":(39.7,42.3,-80.6,-74.6),"RI":(41.1,42.1,-71.9,-71.1),
+ "SC":(32.0,35.3,-83.4,-78.5),"SD":(42.4,45.9,-104.1,-96.4),"TN":(34.9,36.7,-90.4,-81.6),
+ "TX":(25.8,36.6,-106.7,-93.5),"UT":(36.9,42.1,-114.1,-109.0),"VT":(42.7,45.1,-73.5,-71.4),
+ "VA":(36.5,39.5,-83.7,-75.2),"WA":(45.5,49.1,-124.9,-116.9),"WV":(37.1,40.7,-82.7,-77.7),
+ "WI":(42.4,47.1,-92.9,-86.7),"WY":(40.9,45.1,-111.1,-104.0),"DC":(38.8,39.0,-77.2,-76.9),
+}
+BBOX_MARGIN = 0.3  # ~33 km slack so border venues never get falsely cleared
+
+def _in_bbox(lat, lng, box):
+    a, b, c, d = box
+    return (a - BBOX_MARGIN) <= lat <= (b + BBOX_MARGIN) and (c - BBOX_MARGIN) <= lng <= (d + BBOX_MARGIN)
+
+def _in_us(lat, lng):
+    return (_in_bbox(lat, lng, (24.4, 49.4, -125.0, -66.9))
+            or _in_bbox(lat, lng, STATE_BBOX["AK"]) or _in_bbox(lat, lng, STATE_BBOX["HI"]))
+
+def coords_contradict_text(lat, lng, text):
+    """True only when coordinates PROVABLY contradict the location text.
+    Weak (abbrev-only) evidence counts only for pins inside the US, so foreign
+    country codes like ', DE' can never clear a correct foreign pin. Foreign-vs-
+    foreign and unknowns return False (cannot judge = do not touch)."""
+    try:
+        lat, lng = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return False
+    countries, strong, weak = _geo_tokens3(text)
+    states = strong | weak
+    if states:
+        if any(_in_bbox(lat, lng, STATE_BBOX[s]) for s in states if s in STATE_BBOX):
+            return False
+        return bool(strong) or _in_us(lat, lng)
+    if countries == {"united states"}:
+        return not _in_us(lat, lng)
+    return False
 
 # Records that are stories ABOUT events (hoaxes, rumors, denials), not events.
 NON_EVENT_RE = re.compile(
     r"\b(fake news|real or fake|hoax|debunk\w*|rumou?rs?|not true|untrue|falsely|"
-    r"denies|denied|will not (?:be )?(?:perform|appear|happen)|won'?t (?:be )?(?:perform|appear)|"
+    r"denies|denied|will not (?:be )?(?:perform\w*|appear\w*|present|attend\w*|happen\w*|there)|"
+    r"won'?t (?:be )?(?:perform\w*|appear\w*|present|attend\w*)|"
+    r"uncertaint\w* (?:about|surrounding|over) (?:his|her|their|the) (?:performance|appearance|attendance)|"
     r"no plans to|never (?:planned|scheduled)|scam(?:mers?)?|misinformation)\b", re.I)
 
 def looks_like_non_event(name, desc):
@@ -660,17 +722,20 @@ def audit_existing(all_rows, cache):
             dropped_novenue += 1; continue
         addr = r.get("venue_address") or ""
         if (r.get("venue_lat") or "").strip() and addr.strip():
-            entry = cache.get(venue_key(r.get("venue")))
-            if entry:
-                try:
-                    same = (abs(float(entry["lat"]) - float(r["venue_lat"])) < 0.02 and
-                            abs(float(entry["lng"]) - float(r["venue_lng"])) < 0.02)
-                except (ValueError, TypeError, KeyError):
-                    same = False
-                if same and not entry_matches_text(entry, addr):
-                    r["venue_lat"] = ""; r["venue_lng"] = ""
-                    r["venue_map_status"] = ""; r["region"] = ""
-                    cleared += 1
+            bad = coords_contradict_text(r["venue_lat"], r["venue_lng"], addr)
+            if not bad:
+                entry = cache.get(venue_key(r.get("venue")))
+                if entry:
+                    try:
+                        same = (abs(float(entry["lat"]) - float(r["venue_lat"])) < 0.02 and
+                                abs(float(entry["lng"]) - float(r["venue_lng"])) < 0.02)
+                    except (ValueError, TypeError, KeyError):
+                        same = False
+                    bad = same and not entry_matches_text(entry, addr)
+            if bad:
+                r["venue_lat"] = ""; r["venue_lng"] = ""
+                r["venue_map_status"] = ""; r["region"] = ""
+                cleared += 1
         kept.append(r)
     print(f"Audit: dropped {dropped_fake} suspected non-events, {dropped_novenue} venue-less rows, "
           f"cleared {cleared} inconsistent geocodes for re-geocoding.")
@@ -729,7 +794,7 @@ def geocode(all_rows, cache, cmap):
                 city = a.get("city") or a.get("town") or a.get("village") or a.get("suburb") or ""
                 e = {"lat": top["lat"], "lng": top["lon"], "city": city,
                      "state": a.get("state",""), "country": a.get("country","")}
-                if not entry_matches_text(e, addr):
+                if not entry_matches_text(e, addr) or coords_contradict_text(e["lat"], e["lng"], addr):
                     rejected += 1; new_failed.add(k)   # result contradicts the record's own location
                     continue
                 v2[k] = e; cache[k] = e
