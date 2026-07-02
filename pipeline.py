@@ -335,6 +335,30 @@ def _pick_year(mo, d):
         if iso: return iso
     return None
 
+
+_ORDINAL_WORDS = {}
+for i, w in enumerate(["first","second","third","fourth","fifth","sixth","seventh","eighth","ninth","tenth",
+    "eleventh","twelfth","thirteenth","fourteenth","fifteenth","sixteenth","seventeenth","eighteenth",
+    "nineteenth","twentieth"], 1): _ORDINAL_WORDS[w] = i
+for i, w in [(21,"twenty-first"),(22,"twenty-second"),(23,"twenty-third"),(24,"twenty-fourth"),
+    (25,"twenty-fifth"),(26,"twenty-sixth"),(27,"twenty-seventh"),(28,"twenty-eighth"),
+    (29,"twenty-ninth"),(30,"thirtieth"),(31,"thirty-first")]: _ORDINAL_WORDS[w] = i
+_YEAR_WORDS = {"twenty-five":2025,"twenty five":2025,"twenty-six":2026,"twenty six":2026,
+               "twenty-seven":2027,"twenty seven":2027,"twenty-eight":2028,"twenty eight":2028}
+_SPELLED_RE = re.compile(
+    r"\b(" + "|".join(_ORDINAL_WORDS) + r")\s+(?:of\s+)?" + _MON +
+    r"(?:\s*,?\s*two\s+thousand\s+(?:and\s+)?(" + "|".join(_YEAR_WORDS) + r"))?", re.I)
+
+def _spelled_date(text):
+    m = _SPELLED_RE.search(str(text or "").replace("\u2013", "-"))
+    if not m: return ""
+    day = _ORDINAL_WORDS.get(m.group(1).lower().replace(" ", "-"))
+    mo = MONTHS.get(m.group(2)[:3].lower())
+    yw = (m.group(3) or "").lower().replace(" ", "-")
+    if not (day and mo): return ""
+    if yw: return _plausible(_YEAR_WORDS[yw], mo, day) or ""
+    return _pick_year(mo, day) or ""
+
 def _human_date(text):
     if not text: return ""
     s = str(text)
@@ -349,7 +373,7 @@ def _human_date(text):
     if m:
         d = int(m.group(1)); mo = MONTHS.get(m.group(2)[:3].lower()); y = m.group(3)
         if mo: return (_plausible(int(y), mo, d) if y else _pick_year(mo, d)) or ""
-    return ""
+    return _spelled_date(s)
 
 def _human_time(text):
     if not text: return ""
@@ -845,9 +869,12 @@ def geocode(all_rows, cache, cmap):
                                      "limit": 1, "addressdetails": 1}, timeout=15)
         return g
 
+    COARSE_TYPES = {"country", "state", "county", "region", "province", "island", "archipelago"}
     def entry_of(g):
         if g.status_code != 200 or not g.json(): return None
         top = g.json()[0]; a = top.get("address", {})
+        if str(top.get("type", "")).lower() in COARSE_TYPES:
+            return None   # a state/county centroid is never a venue location
         city = a.get("city") or a.get("town") or a.get("village") or a.get("suburb") or ""
         return {"lat": top["lat"], "lng": top["lon"], "city": city,
                 "state": a.get("state",""), "country": a.get("country","")}, top, a
