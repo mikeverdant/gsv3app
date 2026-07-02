@@ -95,6 +95,8 @@ def _geo_tokens3(text):
             strong.add(ab)
     for m in _ABBREV_RE.finditer(t):
         if m.group(1) in STATE_BY_ABBREV: weak.add(m.group(1))
+    for m in re.finditer(r",\s*([A-Z]{2})\s+\d{5}(?:-\d{4})?\b", t):
+        if m.group(1) in STATE_BY_ABBREV: strong.add(m.group(1))   # ", VT 05403" cannot be a country code
     if re.search(r"\bd\.?\s?c\.?[\s,.!?]", low): strong.add("DC")
     if strong: countries.add("united states")
     return countries, strong, weak
