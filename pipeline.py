@@ -54,7 +54,7 @@ def blank_row():
 
 # ---------- geographic consistency ----------
 COUNTRY_ALIASES = {
- "united states":"united states","usa":"united states","u.s.":"united states","u.s.a.":"united states","us":"united states","america":"united states",
+ "united states":"united states","united states of america":"united states","usa":"united states","u.s.a":"united states","u.s.":"united states","u.s.a.":"united states","us":"united states","america":"united states",
  "united kingdom":"united kingdom","uk":"united kingdom","england":"united kingdom","scotland":"united kingdom","wales":"united kingdom","northern ireland":"united kingdom","great britain":"united kingdom",
  "south africa":"south africa","canada":"canada","mexico":"mexico","australia":"australia","new zealand":"new zealand","ireland":"ireland","france":"france","germany":"germany","deutschland":"germany",
  "italy":"italy","italia":"italy","spain":"spain","portugal":"portugal","netherlands":"netherlands","the netherlands":"netherlands","holland":"netherlands","belgium":"belgium","switzerland":"switzerland",
@@ -489,21 +489,20 @@ def verify_unpinnable(all_rows):
     _save_json_map("verify_failures.json", sorted(fails))
     still = [r for r, _ in candidates if not (r.get("venue_address") or "").strip()
              or norm_text(r.get("venue_address")) == norm_text(r.get("venue"))]
-    if still:
-        buf = io.StringIO()
-        w = csv.writer(buf); w.writerow(["date", "event_name", "venue", "url"])
-        for r in still: w.writerow([r.get("date"), r.get("event_name"), r.get("venue"), r.get("url")])
-        requests.post(f"{SUPABASE_URL}/storage/v1/object/{IMPORTS_BUCKET}/needs_verification.csv",
-                      headers={**SB, "Content-Type": "text/csv", "x-upsert": "true"},
-                      data=buf.getvalue().encode())
+    buf = io.StringIO()
+    w = csv.writer(buf); w.writerow(["date", "event_name", "venue", "url"])
+    for r in still: w.writerow([r.get("date"), r.get("event_name"), r.get("venue"), r.get("url")])
+    requests.post(f"{SUPABASE_URL}/storage/v1/object/{IMPORTS_BUCKET}/needs_verification.csv",
+                  headers={**SB, "Content-Type": "text/csv", "x-upsert": "true"},
+                  data=buf.getvalue().encode())
     print(f"Verification: {recovered} addresses recovered ({fetched} fetched), {len(still)} held in needs_verification.csv.")
 
 # ---------- domain reputation ----------
 BLOCK_MIN_RECORDS = 20
 BLOCK_BAD_RATIO = 0.5
 
-def update_domain_stats(rows, quarantine):
-    stats = _load_json_map("domain_stats.json", {})
+def update_domain_stats(rows, quarantine, kept_ids=None):
+    stats = _load_json_map("domain_stats_v2.json", {})
     def bump(dom, field):
         if not dom: return
         s = stats.setdefault(dom, {"total": 0, "fake": 0, "unpinned": 0})
@@ -515,12 +514,14 @@ def update_domain_stats(rows, quarantine):
         bump(dom, "fake" if q["reason"].startswith(("suspected non-event", "blocked domain")) else "unpinned")
     for r in rows:
         dom = _domain(r.get("url") or "")
-        bump(dom, "unpinned" if not (r.get("venue_lat") or "").strip() else "total")
+        in_dataset = kept_ids is None or id(r) in kept_ids
+        pinned = bool((r.get("venue_lat") or "").strip())
+        bump(dom, "unpinned" if (in_dataset and not pinned) else "total")
     blocked = sorted(d for d, s in stats.items()
                      if s["total"] >= BLOCK_MIN_RECORDS
-                     and (s.get("fake", 0) + s.get("unpinned", 0)) / s["total"] > BLOCK_BAD_RATIO)
-    _save_json_map("domain_stats.json", stats)
-    _save_json_map("blocked_domains.json", blocked)
+                     and s.get("fake", 0) / s["total"] > BLOCK_BAD_RATIO)
+    _save_json_map("domain_stats_v2.json", stats)
+    _save_json_map("blocked_domains_v2.json", blocked)
     buf = io.StringIO()
     w = csv.writer(buf); w.writerow(["domain", "total_records", "fake_or_rumor", "unpinnable", "bad_ratio", "blocked"])
     for d, s in sorted(stats.items(), key=lambda kv: -((kv[1].get("fake",0)+kv[1].get("unpinned",0)) / max(kv[1]["total"],1))):
@@ -544,7 +545,7 @@ def fetch_import():  # returns (rows, quarantine)
         data = gzip.decompress(data)
     except OSError:
         pass  # already plain text
-    blocked = set(_load_json_map("blocked_domains.json", []))
+    blocked = set(_load_json_map("blocked_domains_v2.json", []))
     rows, quarantine = parse_import_records(data.decode("utf-8", errors="replace").splitlines(), blocked)
     print(f"Import: {len(rows)} events parsed, {len(quarantine)} quarantined before rescue.")
     rescued, quarantine = rescue_by_url(quarantine)
@@ -631,7 +632,7 @@ def apply_coords(r, hit):
     if not (r.get("region") or "").strip() and hit["city"]: r["region"] = hit["city"]
     r["venue_map_status"] = "show"
 
-FAILURES_NAME = "geocode_failures.json"
+FAILURES_NAME = "geocode_failures_v2.json"
 
 def load_failures():
     r = requests.get(f"{SUPABASE_URL}/storage/v1/object/{IMPORTS_BUCKET}/{FAILURES_NAME}", headers=SB)
@@ -718,6 +719,11 @@ def geocode(all_rows, cache, cmap):
             g = requests.get("https://us1.locationiq.com/v1/search",
                              params={"key": LOCATIONIQ_KEY, "q": q, "format": "json",
                                      "limit": 1, "addressdetails": 1}, timeout=15)
+            if g.status_code == 429:
+                time.sleep(2.5)
+                g = requests.get("https://us1.locationiq.com/v1/search",
+                                 params={"key": LOCATIONIQ_KEY, "q": q, "format": "json",
+                                         "limit": 1, "addressdetails": 1}, timeout=15)
             if g.status_code == 200 and g.json():
                 top = g.json()[0]; a = top.get("address", {})
                 city = a.get("city") or a.get("town") or a.get("village") or a.get("suburb") or ""
@@ -736,12 +742,13 @@ def geocode(all_rows, cache, cmap):
             else:
                 if failed == 0:
                     print(f"  First geocode failure: HTTP {g.status_code} {g.text[:150]}")
-                failed += 1; new_failed.add(k)
+                failed += 1
+                if g.status_code == 404: new_failed.add(k)   # only "cannot geocode" is permanent; 429/5xx retry next run
         except Exception as ex:
             if failed == 0:
                 print(f"  First geocode failure: {ex}")
             failed += 1
-        time.sleep(0.6)
+        time.sleep(1.1)
 
     for r in all_rows:
         if (r.get("venue_lat") or "").strip(): continue
@@ -802,7 +809,7 @@ def main():
     geocoded, failed = geocode(all_rows, cache, cmap)
     upcoming = publish_json(all_rows)
     push_csv(all_rows, sha)
-    update_domain_stats(new_rows, quarantine)
+    update_domain_stats(new_rows, quarantine, {id(r) for r in all_rows})
     print("=" * 40)
     print(f"DONE. total={len(all_rows)} upcoming={upcoming} imported={len(new_rows)} "
           f"dupes_folded={dropped} quarantined={len(quarantine)} geocoded_new={geocoded} geocode_failed={failed}")
