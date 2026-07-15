@@ -4,8 +4,10 @@ Flow: pull imports/latest.ndjson.gz (Supabase) -> parse -> merge with GitHub CSV
 Secrets come from environment variables (GitHub Actions secrets vault).
 """
 import os, sys, json, csv, io, re, time, base64, gzip, unicodedata
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import requests
+from timezonefinder import TimezoneFinder
 
 # ---------- config ----------
 SUPABASE_URL = "https://hmluygfhvdegmealscky.supabase.co"
@@ -230,9 +232,9 @@ def _save_json_map(name, obj):
 def _date_from_page(html):
     for rx in (JSONLD_RE, TIMEATTR_RE, META_RE):
         for m in rx.finditer(html):
-            d, t = _parse_date(m.group(1))
-            if d: return d, t
-    return "", ""
+            d, t, off = _parse_date(m.group(1))
+            if d: return d, t, off
+    return "", "", ""
 
 def rescue_by_url(quarantine):
     """Try to recover date-missing records by reading their source pages."""
@@ -252,9 +254,13 @@ def rescue_by_url(quarantine):
 
     for q, rec, url in candidates:
         handled.add(id(q))
-        d, t = "", ""
+        d, t, off = "", "", ""
         if url in url_dates:
-            d, t = url_dates[url]
+            cached = url_dates[url]
+            # Entries cached before timezone handling existed are [d, t] with no
+            # offset; newer ones are [d, t, off]. Both shapes must load.
+            d, t = cached[0], cached[1]
+            off = cached[2] if len(cached) > 2 else ""
         elif url in url_fails or fetched >= RESCUE_CAP:
             still_quarantined.append(q); continue
         else:
@@ -263,15 +269,15 @@ def rescue_by_url(quarantine):
                 pg = requests.get(url, timeout=10,
                                   headers={"User-Agent": "Mozilla/5.0 (GSV3 event pipeline)"})
                 if pg.status_code == 200:
-                    d, t = _date_from_page(pg.text[:400000])
+                    d, t, off = _date_from_page(pg.text[:400000])
             except Exception:
                 pass
             time.sleep(RESCUE_DELAY)
-            if d: url_dates[url] = [d, t]
+            if d: url_dates[url] = [d, t, off]
             else: url_fails.add(url)
         if not d:
             still_quarantined.append(q); continue
-        row = _record_to_row(rec, d, t)
+        row = _record_to_row(rec, d, t, off)
         if isinstance(row, dict): rescued_rows.append(row)
         else: still_quarantined.append(q)
 
@@ -393,26 +399,130 @@ def _human_time(text):
     return f"{hh:02d}:{mm:02d}"
 
 def _parse_date(val):
-    """Return (YYYY-MM-DD, HH:MM) from ISO-ish STRING values only.
+    """Return (YYYY-MM-DD, HH:MM, tz_offset) from ISO-ish STRING values only.
+
+    tz_offset is the timezone marker found on the source timestamp: "Z" / "+00:00"
+    for UTC, "-07:00" style for a fixed offset, or "" when the source gave a naive
+    wall-clock time.
+
+    WHY THIS MATTERS: sources like allevents.in publish event times in UTC. The
+    old version of this function matched only the date and HH:MM digits and threw
+    the offset away, so a show at 8pm Pacific (2026-07-14T03:00:00Z) was stored as
+    "2026-07-14 / 03:00" — wrong day, wrong time. Keeping the offset lets
+    localize_times() convert to the venue's actual local clock after geocoding.
+
     Numeric epoch values are ignored on purpose: the export's epoch field is the
     scrape timestamp, not the event date, and a wrong date is worse than no date."""
     if isinstance(val, list) and val: val = val[0]
     if isinstance(val, dict): val = val.get("start") or val.get("date") or ""
-    if isinstance(val, (int, float)): return "", ""
+    if isinstance(val, (int, float)): return "", "", ""
     s = str(val or "").strip()
-    if re.fullmatch(r"\d{10,16}", s): return "", ""
-    m = re.search(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})", s)
+    if re.fullmatch(r"\d{10,16}", s): return "", "", ""
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::\d{2})?(?:\.\d+)?\s*(Z|[+-]\d{2}:?\d{2})?", s)
     if m:
         iso = _plausible(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         t = f"{m.group(4)}:{m.group(5)}"
-        return (iso or ""), ("" if not iso or t == "00:00" else t)
+        off = (m.group(6) or "").strip()
+        if not iso:
+            return "", "", ""
+        # A bare 00:00 with NO timezone marker is the classic "date only, no time
+        # supplied" case, so it stays blank. But 00:00 WITH an offset (e.g.
+        # 2026-07-14T00:00:00Z) is a real instant that localizes to a real
+        # evening time, so it must be kept.
+        if t == "00:00" and not off:
+            return iso, "", ""
+        return iso, t, off
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
-        return (_plausible(int(m.group(1)), int(m.group(2)), int(m.group(3))) or ""), ""
-    return "", ""
+        return (_plausible(int(m.group(1)), int(m.group(2)), int(m.group(3))) or ""), "", ""
+    return "", "", ""
 
 
-def _record_to_row(rec, d, t):
+_TF = TimezoneFinder()
+_TZ_CACHE = {}
+
+
+def _tz_for(lat, lng):
+    """Venue-local IANA timezone from coordinates, memoised per run.
+    timezonefinder does a point-in-polygon lookup against the tz boundary map,
+    so this is offline (no API cost) but not free — hence the cache."""
+    try:
+        latf, lngf = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None
+    key = (round(latf, 3), round(lngf, 3))
+    if key in _TZ_CACHE:
+        return _TZ_CACHE[key]
+    name = None
+    try:
+        name = _TF.timezone_at(lat=latf, lng=lngf)
+    except Exception:
+        name = None
+    zone = None
+    if name:
+        try:
+            zone = ZoneInfo(name)
+        except Exception:
+            zone = None
+    _TZ_CACHE[key] = zone
+    return zone
+
+
+def _offset_to_tzinfo(off):
+    """Turn a captured offset marker into a tzinfo. "" means naive."""
+    if not off:
+        return None
+    if off.upper() == "Z":
+        return timezone.utc
+    m = re.fullmatch(r"([+-])(\d{2}):?(\d{2})", off)
+    if not m:
+        return None
+    sign = 1 if m.group(1) == "+" else -1
+    delta = timedelta(hours=int(m.group(2)), minutes=int(m.group(3)))
+    return timezone(sign * delta)
+
+
+def localize_times(all_rows):
+    """Convert absolute (offset-bearing) source timestamps into the venue's local
+    wall clock. Runs AFTER geocoding, because the venue's timezone comes from its
+    coordinates.
+
+    Rows are only touched when we have all three of: a stored offset, a real
+    date+time, and coordinates. Anything else is left exactly as-is — a wrong
+    time is worse than an unconverted one.
+
+    tz_offset is a working field only; publish_json/push_csv write APP_COLUMNS,
+    so it never reaches events.json or the CSV."""
+    converted = skipped = 0
+    for r in all_rows:
+        off = (r.get("tz_offset") or "").strip()
+        if not off:
+            continue
+        d = (r.get("date") or "").strip()
+        t = (r.get("start_time") or "").strip()
+        if not d or not re.fullmatch(r"\d{2}:\d{2}", t):
+            continue
+        src_tz = _offset_to_tzinfo(off)
+        if src_tz is None:
+            continue
+        zone = _tz_for(r.get("venue_lat"), r.get("venue_lng"))
+        if zone is None:
+            skipped += 1
+            continue
+        try:
+            aware = datetime.fromisoformat(f"{d}T{t}:00").replace(tzinfo=src_tz)
+        except ValueError:
+            continue
+        local = aware.astimezone(zone)
+        r["date"] = local.date().isoformat()
+        r["start_time"] = local.strftime("%H:%M")
+        r["tz_offset"] = ""  # converted; don't double-convert on a later run
+        converted += 1
+    print(f"localize: converted={converted} no_tz_for_coords={skipped}")
+    return converted
+
+
+def _record_to_row(rec, d, t, off=""):
     labels = _labels_from_text(_get(rec, "claim", "text", "content", "body", "description"))
     name = str(_get(rec, "event_name", "event_title", "name", "title", "event") or "").strip()
     if not name or not d: return None
@@ -426,12 +536,16 @@ def _record_to_row(rec, d, t):
     desc = labels.get("description", "").strip() or ("" if ANY_LABEL_RE.search(raw_desc) else raw_desc)
     genres = str(_get(rec, "genres", "genre") or labels.get("genres", "")).strip()
     cat = str(_get(rec, "category") or "").strip() or infer_category(name, venue, genres, desc)
-    stime = str(_get(rec, "start_time", "time") or "").strip() or t
+    # A start_time supplied as its own field is a local wall clock already, so
+    # it carries no offset. Only the timestamp parsed by _parse_date does.
+    explicit = str(_get(rec, "start_time", "time") or "").strip()
+    stime = explicit or t
+    row_off = "" if explicit else off
     if not venue and not addr: return "NO_VENUE"
     row = blank_row()
     row.update({"date": d, "start_time": stime, "event_name": name, "venue": venue,
                 "venue_address": addr, "url": url, "category": cat,
-                "price": price, "description": desc})
+                "price": price, "description": desc, "tz_offset": row_off})
     return row
 
 def parse_import_records(lines, blocked_domains=None):
@@ -453,12 +567,13 @@ def parse_import_records(lines, blocked_domains=None):
             continue
         labels = _labels_from_text(_get(rec, "claim", "text", "content", "body", "description"))
         name = str(_get(rec, "event_name", "event_title", "name", "title", "event") or "").strip()
-        d, t = _parse_date(_get(rec, "event_dates", "date", "start_date", "start", "datetime"))
+        d, t, off = _parse_date(_get(rec, "event_dates", "date", "start_date", "start", "datetime"))
         if not d:
             srcv = labels.get("datetime") or labels.get("eventdates") or ""
             d = _human_date(srcv)
             t = t or _human_time(srcv)
-        row = _record_to_row(rec, d, t) if (name and d) else None
+            off = ""  # human-readable strings are local wall clock, never UTC
+        row = _record_to_row(rec, d, t, off) if (name and d) else None
         if isinstance(row, dict):
             rows.append(row)
         else:
@@ -977,6 +1092,9 @@ def main():
     all_rows = audit_existing(all_rows, cache)
     verify_unpinnable(all_rows)
     geocoded, failed = geocode(all_rows, cache, cmap)
+    # Must run AFTER geocode (needs venue coords) and BEFORE publish/push, so the
+    # local wall clock is what lands in events.json and the CSV.
+    localize_times(all_rows)
     upcoming = publish_json(all_rows)
     push_csv(all_rows, sha)
     update_domain_stats(new_rows, quarantine, {id(r) for r in all_rows})
