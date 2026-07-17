@@ -180,7 +180,16 @@ NON_EVENT_RE = re.compile(
     r"uncertaint\w* (?:about|surrounding|over) (?:his|her|their|the) (?:performance|appearance|attendance)|"
     r"no plans to|never (?:planned|scheduled)|scam(?:mers?)?|misinformation)\b", re.I)
 
+# Products sold alongside events (gift cards, parking passes, shuttles), not
+# events themselves. Matched against the NAME ONLY: a description saying
+# "free parking available" must never kill a real event.
+MERCH_RE = re.compile(
+    r"\b(gift ?cards?|parking pass(?:es)?|parking only|park (?:&|and) ride|"
+    r"shuttle (?:to|bus|service)|camping pass(?:es)?|vip upgrade|"
+    r"meet (?:&|and) greet upgrade)\b", re.I)
+
 def looks_like_non_event(name, desc):
+    if MERCH_RE.search(name or ""): return True
     return bool(NON_EVENT_RE.search(f"{name} {desc}"))
 
 # ---------- category keywords (mirrors app inferCategory) ----------
@@ -221,30 +230,70 @@ _CAT_PATTERNS = {
     for cat, kws in CATEGORY_KEYWORDS.items()
 }
 
+# Terms that, appearing in the event NAME, are definitional on their own:
+# "concert" means a concert, "farmers market" means a farmers market. These
+# have essentially no second meaning, so a single name hit decides. Everything
+# else (theater, festival, civic, party, band names...) is ambiguous and can
+# only SUPPORT a category, never decide it alone.
+CATEGORY_DEFINITIONAL = {
+  "Wellness":     ["yoga","meditation","sound bath","breathwork","reiki","pilates","tai chi"],
+  "Comedy":       ["comedy","comedian","comedians","standup","stand-up","improv"],
+  "Film":         ["screening","documentary","movie","film festival"],
+  "Dance":        ["salsa","bachata","tango","milonga","swing dance","line dancing","ballet","ballroom"],
+  "Theater":      ["musical","opera","cabaret","burlesque","pantomime"],
+  "Sports":       ["rodeo","marathon","5k","10k","fun run","regatta"],
+  "Markets":      ["farmers market","flea market","craft fair","swap meet","bazaar","flohmarkt","vendor market"],
+  "Food & Drink": ["food truck","tasting","brewery","distillery","winery","ribfest","food festival","bbq"],
+  "Talks":        ["lecture","keynote","seminar","symposium","book club","author talk"],
+  "Family":       ["storytime","story time"],
+  "Arts":         ["exhibition","exhibit","art show","art fair","poetry"],
+  "Nightlife":    ["nightclub","dj set","rave","club night","after party","techno","house music"],
+  "Music":        ["concert","concerts","live music","symphony","orchestra","philharmonic","recital","choir","quartet"],
+  "Community":    ["fundraiser","parade","street fair"],
+}
+
+_DEF_PATTERNS = {
+    cat: [re.compile(r"\b" + re.escape(k) + r"\b") for k in kws]
+    for cat, kws in CATEGORY_DEFINITIONAL.items()
+}
+
 
 def infer_category(name, venue, genres, description):
-    """Score every category and take the best.
+    """Score every category; a category may WIN only with corroboration.
 
-    The event NAME carries the real signal. Descriptions are boilerplate
-    ("promising an unforgettable experience...") and used to drag everything
-    into Music, so name hits score 5, venue 2, description 1. A farmers market
-    whose blurb mentions "live music" now stays in Markets, because "market" in
-    the name outweighs "music" in the description.
+    Name hits score 5, venue 2, description 1 (the name carries the real
+    signal; descriptions are boilerplate). But scoring alone is not enough:
+    a category qualifies to win only when EITHER
+      (a) a definitional term appears in the name ("concert", "standup",
+          "farmers market" — words with no second meaning), OR
+      (b) it has two or more independent keyword hits across name, venue,
+          and description — evidence that corroborates itself.
+    One ambiguous word never decides. A band called "Puppy Pool Party" at a
+    community center matches nothing definitional and nothing twice, so it
+    stays "Event" instead of becoming a pool party. A venue named "...Theatre"
+    can no longer drag a Vince Gill concert into Theater by itself.
 
-    Returns "Event" when nothing scores. That is deliberate: an honest
-    uncategorised event beats a confidently wrong one."""
+    If the two best qualifying categories tie, the answer is "Event": refusal
+    beats a coin flip, same as geocoding."""
     n = (name or "").lower()
     v = (venue or "").lower()
     d = f"{genres or ''} {description or ''}".lower()
-    best, best_score = "Event", 0
+    best, best_score, second_score = "Event", 0, 0
     for cat, pats in _CAT_PATTERNS.items():
-        score = 0
+        score, hits = 0, 0
         for p in pats:
-            if p.search(n): score += 5
-            if p.search(v): score += 2
-            if p.search(d): score += 1
+            if p.search(n): score += 5; hits += 1
+            if p.search(v): score += 2; hits += 1
+            if p.search(d): score += 1; hits += 1
+        definitional = any(p.search(n) for p in _DEF_PATTERNS.get(cat, []))
+        if not definitional and hits < 2:
+            continue  # one ambiguous signal never decides
         if score > best_score:
-            best, best_score = cat, score
+            best, best_score, second_score = cat, score, best_score
+        elif score > second_score:
+            second_score = score
+    if best_score > 0 and best_score == second_score:
+        return "Event"  # two categories equally likely -> honest refusal
     return best
 
 
@@ -895,8 +944,20 @@ def fetch_github_csv():
     print(f"GitHub CSV: {len(rows)} rows (sha {f['sha'][:7]}).")
     return rows, f["sha"]
 
+def _dedup_name(s):
+    """Name normalization for the dedup key ONLY. norm_text turns a straight
+    apostrophe into a space but silently deletes a curly one, so "People's" and
+    "People’s" produced different keys and both survived. Joining without
+    spaces fixes that and also folds "SummerMaxxing" / "Summer Maxxing".
+    Trailing generic words are stripped so "America's Block Party" and
+    "America's Block Party Concert" collapse to one listing."""
+    toks = norm_text(s).split()
+    while toks and toks[-1] in {"concert", "concerts", "tickets", "show", "event", "live"}:
+        toks.pop()
+    return "".join(toks)
+
 def dedup(existing, new):
-    key = lambda r: (r.get("date","").strip(), r.get("start_time","").strip(), norm_text(r.get("event_name")))
+    key = lambda r: (r.get("date","").strip(), r.get("start_time","").strip(), _dedup_name(r.get("event_name")))
     merged, internal, dropped = {}, 0, 0
     for r in existing:
         k = key(r)
