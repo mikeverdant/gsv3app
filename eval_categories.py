@@ -51,10 +51,15 @@ SYSTEM = """You classify live events for a discovery app. People use it to decid
 
 Work the steps. Do not jump to a label.
 
-STEP 1 - IS IT AN EVENT?
+STEP 1 - IS IT AN EVENT? (default YES)
 An event is something happening at a time and place that people gather for.
-Set is_event false ONLY for things that are not events at all: gift cards,
-parking passes, camping passes, transport to an event, merchandise.
+Set is_event false ONLY when the text POSITIVELY says the listing is a product
+rather than a gathering: a gift card, a parking or camping pass, transport to an
+event, merchandise. The text must say so.
+Missing information is NOT evidence. A bare name with no venue and no
+description is an event we know little about, not a non-event. When in doubt,
+is_event is true: a wrongly deleted event can never be found by anyone, while a
+poorly labelled one still exists.
 Private, invite-only, members-only and sold-out things ARE events. Being hard to
 get into is not the same as not existing. Never exclude them.
 
@@ -116,12 +121,18 @@ BASIS - be honest about how you know
 Report the basis for your primary:
   "known_act"      - you recognise the named act/production and know what it does
   "stated_in_text" - the text plainly says what kind of event it is
-  "inferred"       - not stated, but the text gives real evidence you reasoned from
+  "inferred"       - the NAME or DESCRIPTION contains real evidence you reasoned
+                     from, beyond the bare fact that this is a listing
   "guess"          - you are pattern-matching. You do not actually know.
-Use "guess" whenever you do not genuinely know, including when a name is
+"inferred" is NOT a softer word for guess. If the only thing supporting your
+answer is the venue, or the venue's name, or simply that this looks like the
+kind of listing where such events happen, that is "guess". Reasoning from the
+venue is forbidden by STEP 2, so it can never be a basis for anything.
+Use "guess" whenever you do not genuinely know, including when an act name is
 unfamiliar and you are reading the format rather than the facts. Guessing is
-expected sometimes and reporting it honestly is correct and useful. Never label
-a basis stronger than it truly is.
+expected sometimes and reporting it honestly is correct and useful: a "guess" is
+handled safely downstream, a false "known_act" is not. Never label a basis
+stronger than it truly is.
 
 CATEGORIES - pick exactly one primary. There is no "unknown" option.
 Music        - a musical performance is the offering: concerts, gigs, DJ sets, tribute acts, orchestras, music festivals, music open mics
@@ -188,7 +199,11 @@ EXAMPLES_USER = """Classify these events:
 
 10. NAME: Fernhill Sewing Circle
    VENUE: Brightway Superstore
-   ABOUT: Come learn, improve your skills, or just socialize while you sew."""
+   ABOUT: Come learn, improve your skills, or just socialize while you sew.
+
+11. NAME: Wrenfield Gray
+   VENUE: 
+   ABOUT: """
 
 EXAMPLES_ASSISTANT = """[{"i":1,"is_event":true,"offering":"the band's set","primary":"Music","secondary":"","secondary_element":"","basis":"inferred"},
 {"i":2,"is_event":true,"offering":"a brunch with a drag show","primary":"Food & Drink","secondary":"Theater","secondary_element":"a drag show between courses","basis":"stated_in_text"},
@@ -199,7 +214,8 @@ EXAMPLES_ASSISTANT = """[{"i":1,"is_event":true,"offering":"the band's set","pri
 {"i":7,"is_event":true,"offering":"a growers market","primary":"Markets","secondary":"Music","secondary_element":"a local band playing on the lawn","basis":"stated_in_text"},
 {"i":8,"is_event":true,"offering":"a DJ set of nineties music","primary":"Music","secondary":"","secondary_element":"","basis":"stated_in_text"},
 {"i":9,"is_event":true,"offering":"a storytelling and ministry talk","primary":"Talks","secondary":"","secondary_element":"","basis":"stated_in_text"},
-{"i":10,"is_event":true,"offering":"a sewing social club","primary":"Social","secondary":"","secondary_element":"","basis":"stated_in_text"}]"""
+{"i":10,"is_event":true,"offering":"a sewing social club","primary":"Social","secondary":"","secondary_element":"","basis":"stated_in_text"},
+{"i":11,"is_event":true,"offering":"unclear","primary":"Music","secondary":"","secondary_element":"","basis":"guess"}]"""
 
 # ---------------------------------------------------------------------------
 # GOLDEN: real cases, HELD OUT (nothing here appears in the examples).
@@ -248,6 +264,10 @@ GOLDEN = [
     # must abstain: no information exists
     ("Puppy Pool Party", "Southeast Community Center", "", None, True),
     ("Chanpan", "Polaris Hall", "", None, True),
+    # REGRESSION: v2 marked this real touring artist "not an event" because the
+    # row has no venue and no description. Missing data is not merchandise.
+    # It may honestly abstain on the category; it must never be deleted.
+    ("Zach Top", "", "", None, True),
 ]
 
 
@@ -259,6 +279,10 @@ def call(batch):
     body = {
         "model": MODEL,
         "max_tokens": 4000,
+        # Default is 1.0. The same event landed in two different categories in
+        # one run at 1.0 (same act, golden vs sample). Answers get cached, so a
+        # coin flip becomes permanent. 0 makes reruns comparable.
+        "temperature": 0,
         "system": SYSTEM,
         "messages": [
             {"role": "user", "content": EXAMPLES_USER},
