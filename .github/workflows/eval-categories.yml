@@ -2,8 +2,8 @@ name: Eval categories (manual, writes nothing)
 
 # Deliberately SEPARATE from daily-pipeline.yml. This job reads events.json and
 # calls the Anthropic API to test the classification prompt. It writes nothing:
-# no CSV, no Supabase, no cache. It has no schedule and only runs when you press
-# the button, so it cannot affect the nightly run in any way.
+# no CSV, no Supabase, no cache, no repo. It has no schedule and only runs when
+# you press the button, so it cannot affect the nightly run in any way.
 
 on:
   workflow_dispatch:
@@ -12,10 +12,10 @@ on:
         description: "How many real 'Event' rows to sample"
         required: false
         default: "120"
-      conf_floor:
-        description: "Confidence below this becomes 'Event' (0.0-1.0)"
+      accept_basis:
+        description: "Bases we trust. Anything else becomes 'Event'. Drop 'inferred' to tighten."
         required: false
-        default: "0.6"
+        default: "known_act,stated_in_text,inferred"
 
 permissions:
   contents: read        # read-only: it cannot push to the repo even if it tried
@@ -34,5 +34,5 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SAMPLE_N: ${{ inputs.sample_n }}
-          CONF_FLOOR: ${{ inputs.conf_floor }}
+          ACCEPT_BASIS: ${{ inputs.accept_basis }}
         run: python eval_categories.py
