@@ -184,28 +184,90 @@ def looks_like_non_event(name, desc):
     return bool(NON_EVENT_RE.search(f"{name} {desc}"))
 
 # ---------- category keywords (mirrors app inferCategory) ----------
+#
+# Ordered most-specific first: ties break toward the earlier entry, so a "jazz
+# brunch" lands in Music while a plain "brunch" stays in Food & Drink.
+#
+# Two rules learned the hard way, do not break them:
+#
+#  1. MATCHING IS WORD-BOUNDARY, NOT SUBSTRING. The old version used
+#     `k in text`, so "improv" matched "improve" (a sewing club became Comedy),
+#     "match" matched "matcha" (a tea pop-up became Sports), and "house" matched
+#     "Charlton House" (a history tour became Nightlife).
+#
+#  2. NO GENERIC VERBS. The old Music list held "perform" and "live", which
+#     appear in nearly every event blurb ever written. Combined with
+#     first-match-wins, Music swallowed comedians, ballets, farmers markets and
+#     even a bus shuttle before the right category was ever tested.
 CATEGORY_KEYWORDS = {
-  "Music": ["music","concert","band","live","jazz","bluegrass","acoustic","folk","hip-hop","electronic","dj","orchestra","choir","symphony","recital","vinyl","album","song","sing","perform"],
-  "Comedy": ["comedy","improv","standup","stand-up","comic","laugh","humor","sketch"],
-  "Theater": ["theater","theatre","play","musical","stage","opera","ballet","storytelling","spoken word","cabaret","burlesque"],
-  "Film": ["film","cinema","screening","movie","documentary"],
-  "Arts": ["art","gallery","exhibit","museum","poetry","literary","reading","author","photography","mural"],
-  "Dance": ["salsa","bachata","swing dance","tango","lindy","ballroom","milonga"],
-  "Talks": ["lecture","talk","panel","book club","keynote","seminar","symposium"],
-  "Food & Drink": ["food","drink","beer","wine","cocktail","tasting","dining","brunch","dinner","restaurant","culinary","chef","whiskey","spirits","bar"],
-  "Markets": ["market","farmers","fair","craft","vendor","artisan","bazaar"],
-  "Nightlife": ["nightlife","club","lounge","party","rave","techno","house","late night"],
-  "Community": ["fundraiser","benefit","nonprofit","volunteer","civic","cultural","heritage","meetup","festival","parade","rally"],
-  "Family": ["family","kids","children","all ages","storytime"],
-  "Sports": ["sports","game","tournament","marathon","race","match"],
-  "Wellness": ["yoga","meditation","wellness","mindfulness","sound bath","breathwork"],
+  "Wellness":     ["yoga","meditation","wellness","mindfulness","sound bath","breathwork","reiki","pilates","tai chi","sauna"],
+  "Comedy":       ["comedy","comedian","comedians","improv","standup","stand-up","open mic","sketch comedy"],
+  "Film":         ["film","films","cinema","screening","movie","documentary","imax","film festival"],
+  "Dance":        ["salsa","bachata","swing dance","tango","lindy","ballroom","milonga","ballet","dance party","line dancing","dance troupe"],
+  "Theater":      ["theater","theatre","musical","opera","cabaret","burlesque","broadway","playhouse","pantomime"],
+  "Sports":       ["rodeo","tournament","marathon","5k","10k","fun run","racing","regatta","derby"],
+  "Markets":      ["market","farmers market","flea market","craft fair","vendor market","artisan","bazaar","swap meet","flohmarkt"],
+  "Food & Drink": ["food truck","beer","wine","cocktail","cocktails","tasting","brewery","distillery","winery","culinary","chef","whiskey","bbq","ribfest","food festival","brunch","matcha","coffee"],
+  "Talks":        ["lecture","panel","book club","keynote","seminar","symposium","workshop","author talk"],
+  "Family":       ["storytime","story time","kids","children","toddler","toddlers","babies","family fun","all ages"],
+  "Arts":         ["gallery","exhibition","exhibit","museum","poetry","literary","photography","mural","sculpture","art show","art fair"],
+  "Nightlife":    ["nightclub","nightlife","dj set","rave","techno","house music","late night","club night","after party"],
+  "Music":        ["music","concert","concerts","live music","band","bands","jazz","blues","bluegrass","acoustic","hip-hop","orchestra","choir","symphony","recital","quartet","dj","gig","songwriter","metal","rock","punk","indie","country","folk","electronic","edm","rap","r&b","soul","funk","reggae","classical","pop","tribute","ensemble","philharmonic","tour","album"],
+  "Community":    ["fundraiser","benefit","nonprofit","volunteer","civic","heritage","meetup","meet-up","parade","rally","festival","street fair"],
 }
 
+_CAT_PATTERNS = {
+    cat: [re.compile(r"\b" + re.escape(k) + r"\b") for k in kws]
+    for cat, kws in CATEGORY_KEYWORDS.items()
+}
+
+
 def infer_category(name, venue, genres, description):
-    text = f"{name} {venue} {genres} {description}".lower()
-    for cat, kws in CATEGORY_KEYWORDS.items():
-        if any(k in text for k in kws): return cat
-    return "Event"
+    """Score every category and take the best.
+
+    The event NAME carries the real signal. Descriptions are boilerplate
+    ("promising an unforgettable experience...") and used to drag everything
+    into Music, so name hits score 5, venue 2, description 1. A farmers market
+    whose blurb mentions "live music" now stays in Markets, because "market" in
+    the name outweighs "music" in the description.
+
+    Returns "Event" when nothing scores. That is deliberate: an honest
+    uncategorised event beats a confidently wrong one."""
+    n = (name or "").lower()
+    v = (venue or "").lower()
+    d = f"{genres or ''} {description or ''}".lower()
+    best, best_score = "Event", 0
+    for cat, pats in _CAT_PATTERNS.items():
+        score = 0
+        for p in pats:
+            if p.search(n): score += 5
+            if p.search(v): score += 2
+            if p.search(d): score += 1
+        if score > best_score:
+            best, best_score = cat, score
+    return best
+
+
+def recategorize_all(all_rows):
+    """Recompute `category` for EVERY row, existing and new, on every run.
+
+    Category is derived purely from name/venue/description, all of which are
+    already in the CSV, so this is deterministic and needs no network calls.
+    Running it over the whole set means rows imported under the old buggy
+    inferrer self-heal, and any future tweak to CATEGORY_KEYWORDS reapplies to
+    the entire catalogue automatically instead of only to new arrivals."""
+    changed = 0
+    counts = {}
+    for r in all_rows:
+        before = (r.get("category") or "").strip()
+        after = infer_category(r.get("event_name"), r.get("venue"), "", r.get("description"))
+        if after != before:
+            r["category"] = after
+            changed += 1
+        counts[after] = counts.get(after, 0) + 1
+    top = ", ".join(f"{c}={n}" for c, n in sorted(counts.items(), key=lambda x: -x[1])[:6])
+    print(f"recategorize: {changed} rows changed | {top}")
+    return changed
 
 
 # ---------- URL rescue for date-quarantined records ----------
@@ -535,7 +597,11 @@ def _record_to_row(rec, d, t, off=""):
     raw_desc = str(_get(rec, "description") or "").strip()
     desc = labels.get("description", "").strip() or ("" if ANY_LABEL_RE.search(raw_desc) else raw_desc)
     genres = str(_get(rec, "genres", "genre") or labels.get("genres", "")).strip()
-    cat = str(_get(rec, "category") or "").strip() or infer_category(name, venue, genres, desc)
+    # Deliberately IGNORE any category the source supplied. Feeds come from
+    # ~1,700 domains with their own taxonomies, and taking theirs verbatim is
+    # what filed Jimmy Eat World under Theater and Young the Giant under Family.
+    # One inferrer, one taxonomy, consistent everywhere.
+    cat = infer_category(name, venue, genres, desc)
     # A start_time supplied as its own field is a local wall clock already, so
     # it carries no offset. Only the timestamp parsed by _parse_date does.
     explicit = str(_get(rec, "start_time", "time") or "").strip()
@@ -1095,6 +1161,8 @@ def main():
     # Must run AFTER geocode (needs venue coords) and BEFORE publish/push, so the
     # local wall clock is what lands in events.json and the CSV.
     localize_times(all_rows)
+    # Recompute categories across the whole set so old rows heal too.
+    recategorize_all(all_rows)
     upcoming = publish_json(all_rows)
     push_csv(all_rows, sha)
     update_domain_stats(new_rows, quarantine, {id(r) for r in all_rows})
