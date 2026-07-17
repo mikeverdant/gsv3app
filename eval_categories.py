@@ -2,16 +2,19 @@
 """
 eval_categories.py — PROVE THE PROMPT. WRITES NOTHING, ANYWHERE.
 
-Reads the live events.json, classifies a sample, prints a table. It does not
-touch the CSV, the Supabase tables, the cache, or the pipeline. Run it, read the
-output, change the prompt, run it again. When the numbers are good, and only
-then, the same PROMPT text moves into pipeline.py.
-
-Two parts:
-  GOLDEN  - hand-built cases with known right answers, including every case we
-            argued through. Scored automatically. This is the regression net.
-  SAMPLE  - real rows currently sitting in "Event", printed for eyeballing.
-            No right answer exists for these yet; that is the point of looking.
+v2 changes (all from reading v1's real output):
+  - No real venue or act names anywhere in the prompt. Naming a venue teaches
+    the model a lookup for that venue; naming an act teaches that act. Both
+    suppress correct answers on live data. Principles only.
+  - No enumerated venue types. Whatever gets listed is what gets checked, and
+    the list can never cover every venue. One rule covers all of them.
+  - "confidence" replaced by "basis". A self-rated probability is a vibe: v1
+    never produced anything under 0.65, so the abstain floor could never fire.
+    "What is your basis for this?" is a fact the model can answer honestly.
+    OUR code abstains on basis == "guess".
+  - The venue rule now explicitly governs the secondary field too. v1 leaked
+    venue business into secondary (an outdoor concert got +Food & Drink).
+  - Golden cases are HELD OUT: nothing in GOLDEN appears in the examples.
 
 Cost: about 2 cents.
 """
@@ -25,16 +28,18 @@ import requests
 
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 if not ANTHROPIC_KEY:
-    sys.exit("Missing secret: ANTHROPIC_API_KEY (add it in repo Settings -> Secrets -> Actions)")
+    sys.exit("Missing secret: ANTHROPIC_API_KEY (repo Settings -> Secrets -> Actions)")
 
 EVENTS_JSON = "https://hmluygfhvdegmealscky.supabase.co/storage/v1/object/public/events/events.json"
 MODEL = "claude-haiku-4-5-20251001"
 BATCH = 20
 SAMPLE_N = int(os.environ.get("SAMPLE_N", "120"))
 
-# Confidence below this becomes "Event" in the real pipeline. Applied by OUR
-# code, never by the model. Cached confidence means this is retunable for free.
-CONF_FLOOR = float(os.environ.get("CONF_FLOOR", "0.6"))
+# Which bases we accept. Anything else becomes "Event". Applied by OUR code.
+# Retunable later off the cached basis without re-calling the API.
+ACCEPT_BASIS = set(
+    (os.environ.get("ACCEPT_BASIS") or "known_act,stated_in_text,inferred").split(",")
+)
 
 CATEGORIES = [
     "Music", "Comedy", "Theater", "Film", "Arts", "Dance", "Talks",
@@ -44,178 +49,209 @@ CATEGORIES = [
 
 SYSTEM = """You classify live events for a discovery app. People use it to decide what to go do.
 
-Work through these steps for each event. Do not skip to the label.
+Work the steps. Do not jump to a label.
 
 STEP 1 - IS IT AN EVENT?
 An event is something happening at a time and place that people gather for.
-NOT events: gift cards, parking passes, camping passes, shuttles or transport to
-an event, merchandise. Set is_event false for these.
+Set is_event false ONLY for things that are not events at all: gift cards,
+parking passes, camping passes, transport to an event, merchandise.
 Private, invite-only, members-only and sold-out things ARE events. Being hard to
 get into is not the same as not existing. Never exclude them.
 
-STEP 2 - STRIP THE VENUE'S ORDINARY BUSINESS
-What a venue normally does is never part of the event and never a category.
-A pub pours beer. A restaurant serves dinner. A brewery is open. A comedy club
-usually books comedy. A theater usually books touring acts. None of that tells
-you what THIS event is. A promoter or charity renting a comedy club for a
-fundraiser is running a fundraiser, not comedy.
-Food or drink is a category ONLY when it IS the event (a tasting, a beer
-festival, a food festival) or is bundled into the price (a brunch with a show).
-Food you could simply decline and still attend is the venue, not the event.
+STEP 2 - THE VENUE IS NOT THE EVENT
+What a venue routinely does tells you NOTHING about what any single event there
+is. Any room can be rented by anyone for anything. A room that usually hosts one
+kind of act will host a completely different kind next week, and a room with a
+word in its name does not make that word the category. Never reason from what
+the venue normally does, or from what its name suggests.
+Judge only what the text says is happening at THIS event.
 
-STEP 3 - NAME THE OFFERING
-In a few words, what is the attendee going FOR? Not everything mentioned in the
+STEP 3 - THE VENUE'S ORDINARY SERVICES ARE NOT THE EVENT
+Anything the venue sells or does anyway, that an attendee could simply decline
+and still have the full experience they came for, is not part of the event and
+never a category. If it is optional, it is the venue.
+Food or drink is a category only when it IS the thing being offered, or when it
+is bundled into the price so an attendee cannot decline it.
+
+STEP 4 - NAME THE OFFERING
+In a few words: what is the attendee going FOR? Not everything mentioned in the
 text. The thing itself.
 
-STEP 4 - PRIMARY IS WHAT SURVIVES CANCELLATION
-If two things are genuinely bundled, the primary is the one that still happens
-if the other is cancelled:
-- Cancel the drag show: brunch is still served -> Food & Drink primary
-- Cancel the dinner: the play still runs -> Theater primary
-- Cancel the headliner: the gala still happens -> Community primary
-- Cancel the band at the farmers market: the market still happens -> Markets primary
-- Cancel the band at the pub: there is no event at all -> Music primary
+STEP 5 - PRIMARY IS WHAT SURVIVES CANCELLATION
+When two things are genuinely bundled, ask: if one were cancelled, would the
+other still happen?
+- The one that still happens is the base, and the base is PRIMARY.
+- If cancelling it leaves no event at all, it is PRIMARY.
+Worked through: an added performance inside a larger paid experience does not
+become the primary, because cancelling the performance leaves the experience
+intact. But a performance that IS the event has nothing left when cancelled, so
+it is primary.
 
-STEP 5 - SECONDARY IS RARE. MOST EVENTS HAVE NONE.
-Add a secondary ONLY if you can name a concrete element inside the event in a
-few words: "a drag show during the brunch", "Cypress Hill headlining".
-If you cannot name the element, there is no secondary. Leave both fields "".
-The venue's name, the venue's usual programming, the neighbourhood, and the mood
-are NEVER elements. Do not fill the field just because it exists.
+STEP 6 - SECONDARY IS RARE. MOST EVENTS HAVE NONE.
+Add a secondary ONLY if you can name a concrete element inside THIS event in a
+few words. If you cannot name the element, there is no secondary: leave both
+fields "".
+Everything in STEP 2 and STEP 3 applies here too. The venue, its name, its usual
+programming, its ordinary services, the neighbourhood, and the mood are never
+elements, and never secondaries. Never fill the field just because it exists.
 
 DISTRACTORS - THE OFFERING DECIDES, MODIFIERS DESCRIBE
-One word never flips a category. "A hilarious night with the Grateful Dead" is
-Music: the offering is the band's set and "hilarious" is a modifier.
-Descriptions are auto-generated and usually restate the name and venue with
-filler like "promises an unforgettable experience". Ignore filler. The words
-perform, live, show, experience, celebration mean nothing on their own.
+One word never flips a category. An adjective about the mood of a performance
+describes it; it does not change what the performance is.
+Descriptions are auto-generated and usually restate the name and venue padded
+with filler. Ignore filler. The words perform, live, show, experience and
+celebration carry no category meaning on their own.
 
-PERFORMERS
-Use your knowledge of real acts. A named band, DJ, singer, rapper, or orchestra
-playing a set is Music. A named comedian is Comedy. A named touring production
-is Theater.
-A tribute or cover act is still Music: the offering is a music performance, even
-though the performer is not the artist named.
-A band being MENTIONED is not that band performing. "A DJ playing tributes to X,
-Y and Z" is a DJ set, not those bands.
+PERFORMERS AND WHO IS ACTUALLY PERFORMING
+Use your real knowledge of who a named act is, and classify by what that act
+actually does. Do not assume a name you do not recognise is a musician just
+because the listing looks like a gig. Writers, speakers, preachers, drag
+performers, dancers and comedians all tour and all play the same rooms as bands.
+A tribute or covers act is still the category of the performance being given,
+even though the performer is not the artist named.
+An act being MENTIONED is not that act performing. A performance built around
+other artists' work is the performance actually happening, not those artists.
 
-CONFIDENCE (0.0 to 1.0, how sure you are of the PRIMARY)
-Be near-certain about WHAT THE PERFORMANCE IS. That is a single point of
-failure: a wrong or missing label makes the event unfindable, so refusing costs
-exactly as much as being wrong. If you can identify the performance type,
-COMMIT. Do not hedge.
-Be relaxed about ORDERING two bundled elements. Both get surfaced either way, so
-a close call there is cheap.
-Low confidence is for when you genuinely cannot tell what the event is, not for
-when you are choosing between two reasonable answers.
+BASIS - be honest about how you know
+Report the basis for your primary:
+  "known_act"      - you recognise the named act/production and know what it does
+  "stated_in_text" - the text plainly says what kind of event it is
+  "inferred"       - not stated, but the text gives real evidence you reasoned from
+  "guess"          - you are pattern-matching. You do not actually know.
+Use "guess" whenever you do not genuinely know, including when a name is
+unfamiliar and you are reading the format rather than the facts. Guessing is
+expected sometimes and reporting it honestly is correct and useful. Never label
+a basis stronger than it truly is.
 
-CATEGORIES - pick exactly one primary. There is no "unknown" or "other" option.
+CATEGORIES - pick exactly one primary. There is no "unknown" option.
 Music        - a musical performance is the offering: concerts, gigs, DJ sets, tribute acts, orchestras, music festivals, music open mics
 Comedy       - stand-up, improv, sketch, a comedian's set
-Theater      - plays, musicals, opera, drag shows, burlesque, stage productions
+Theater      - plays, musicals, opera, drag, burlesque, stage productions
 Film         - screenings, movie nights, film festivals
-Arts         - gallery shows, exhibitions, art walks, poetry, literary readings
+Arts         - gallery shows, exhibitions, art walks, installations, poetry, literary readings
 Dance        - social dance nights, dance classes, ballet, dance performances
-Talks        - lectures, panels, author talks, conferences, seminars, workshops, classes
-Food & Drink - food or drink IS the event: tastings, beer and food festivals, bundled meals
+Talks        - lectures, panels, author talks, conferences, conventions, expos, seminars, workshops, classes
+Food & Drink - food or drink IS the offering: tastings, food and drink festivals, bundled meals
 Markets      - farmers markets, craft fairs, flea markets, vendor markets, swap meets
 Nightlife    - club nights, raves, late-night parties where the scene itself is the draw
-Community    - fundraisers, galas, parades, civic and cultural festivals, pride, neighbourhood events
-Family       - programming aimed at children: storytimes, playgroups, kids' activities
-Sports       - games, races, tournaments, matches, rodeos
+Community    - fundraisers, galas, parades, civic and cultural festivals, pride, neighbourhood events, fairs
+Family       - programming aimed at children: storytimes, playgroups, kids' activities and camps
+Sports       - games, races, tournaments, matches, leagues, rodeos
 Wellness     - yoga, meditation, sound baths, fitness
-Social       - the offering is being among people or meeting them: trivia nights, meetups, game nights, speed dating, singles nights, mixers, social clubs
+Social       - the offering is being among people or meeting them: trivia, meetups, game nights, speed dating, singles nights, mixers, social clubs
 
 OUTPUT
 A JSON array only. One object per input event, same order, no prose, no fences:
-[{"i":1,"is_event":true,"offering":"the band's set","primary":"Music","secondary":"","secondary_element":"","confidence":0.95}]"""
+[{"i":1,"is_event":true,"offering":"...","primary":"Music","secondary":"","secondary_element":"","basis":"known_act"}]"""
 
-# Few-shot examples deliberately CARRY their distractors, because clean examples
-# do not teach a model to ignore noise; examples showing noise being ignored do.
+# Few-shot examples. Every venue and act is INVENTED and generic on purpose:
+# a real name here becomes a lookup the model applies to live data, which would
+# suppress the correct answer at that venue or for that act. The examples exist
+# to demonstrate reasoning through distractors, not to teach any instance.
 EXAMPLES_USER = """Classify these events:
 
-1. NAME: The Grateful Dead
-   VENUE: Star Theater
-   ABOUT: A hilarious and unforgettable night as the Grateful Dead perform live at the Star Theater. Food and drink available.
+1. NAME: The Hollow Pines
+   VENUE: The Rusty Anchor
+   ABOUT: A hilarious and unforgettable night as The Hollow Pines perform live. Full bar and kitchen open till late.
 
-2. NAME: Drag Brunch
-   VENUE: Lips SF
+2. NAME: Sunday Drag Brunch
+   VENUE: Marigold Room
    ABOUT: Bottomless mimosas and a full brunch menu, with a drag show performed between courses. $45 includes brunch.
 
-3. NAME: Boys & Girls Club Annual Fundraiser
-   VENUE: Cobb's Comedy Club
-   ABOUT: An evening supporting Boys & Girls Club of America programs for local kids. Silent auction and dinner.
+3. NAME: Northside Youth Trust Annual Benefit
+   VENUE: The Chuckle Hut Comedy Club
+   ABOUT: An evening supporting Northside Youth Trust's programs for local kids. Silent auction and dinner.
 
-4. NAME: Trivia Night
-   VENUE: Fort Point Brewery
-   ABOUT: Weekly pub trivia. Teams of up to six. Beer and food available at the bar.
+4. NAME: Tuesday Quiz Night
+   VENUE: Ironworks Brewing Co
+   ABOUT: Weekly pub quiz. Teams of up to six. Beer and food available at the bar.
 
-5. NAME: Puppy Pool Party
-   VENUE: Southeast Community Center
-   ABOUT: Puppy Pool Party is an event at Southeast Community Center promising an unforgettable experience.
+5. NAME: Otter Splash Bash
+   VENUE: Meadowbrook Community Center
+   ABOUT: Otter Splash Bash is an event at Meadowbrook Community Center promising an unforgettable experience.
 
-6. NAME: Winthrop R&B Festival - PARKING PASS
-   VENUE: Winthrop Fairgrounds
-   ABOUT: Parking pass for the Winthrop R&B Festival.
+6. NAME: Riverbend Blues Festival - PARKING PASS
+   VENUE: Riverbend Fairgrounds
+   ABOUT: Parking pass for the Riverbend Blues Festival.
 
-7. NAME: Saturday Farmers Market
-   VENUE: Laurelhurst Park
-   ABOUT: Local produce, bread and flowers every Saturday morning, with live music from the Cedar Ridge Band on the lawn.
+7. NAME: Saturday Growers Market
+   VENUE: Elmwood Park
+   ABOUT: Local produce, bread and flowers every Saturday morning, with live music from a local band on the lawn.
 
-8. NAME: 90s Night: A Tribute to Nirvana, Pearl Jam and Soundgarden
-   VENUE: The Independent
-   ABOUT: DJ Rick spins the grunge era all night long.
+8. NAME: Decades Night: A Tribute to the Grunge Era
+   VENUE: The Lantern Hall
+   ABOUT: A DJ spins nineties classics all night long.
 
-9. NAME: Cheekface
-   VENUE: Kilby Court
-   ABOUT: 
+9. NAME: Marisol Vance
+   VENUE: The Foundry Room
+   ABOUT: An evening with Marisol Vance, who will share stories from her life and her years in ministry.
 
-10. NAME: Sewing Club
-   VENUE: Tesco Extra Bulwell
+10. NAME: Fernhill Sewing Circle
+   VENUE: Brightway Superstore
    ABOUT: Come learn, improve your skills, or just socialize while you sew."""
 
-EXAMPLES_ASSISTANT = """[{"i":1,"is_event":true,"offering":"the band's set","primary":"Music","secondary":"","secondary_element":"","confidence":0.97},
-{"i":2,"is_event":true,"offering":"a brunch with a drag show","primary":"Food & Drink","secondary":"Theater","secondary_element":"a drag show between courses","confidence":0.8},
-{"i":3,"is_event":true,"offering":"a charity fundraiser","primary":"Community","secondary":"","secondary_element":"","confidence":0.95},
-{"i":4,"is_event":true,"offering":"pub trivia","primary":"Social","secondary":"","secondary_element":"","confidence":0.93},
-{"i":5,"is_event":true,"offering":"unclear","primary":"Social","secondary":"","secondary_element":"","confidence":0.2},
-{"i":6,"is_event":false,"offering":"a parking pass","primary":"Community","secondary":"","secondary_element":"","confidence":0.0},
-{"i":7,"is_event":true,"offering":"a farmers market","primary":"Markets","secondary":"Music","secondary_element":"the Cedar Ridge Band playing on the lawn","confidence":0.95},
-{"i":8,"is_event":true,"offering":"a DJ set of 90s grunge","primary":"Music","secondary":"","secondary_element":"","confidence":0.92},
-{"i":9,"is_event":true,"offering":"Cheekface playing a set","primary":"Music","secondary":"","secondary_element":"","confidence":0.9},
-{"i":10,"is_event":true,"offering":"a sewing club meetup","primary":"Social","secondary":"","secondary_element":"","confidence":0.75}]"""
+EXAMPLES_ASSISTANT = """[{"i":1,"is_event":true,"offering":"the band's set","primary":"Music","secondary":"","secondary_element":"","basis":"inferred"},
+{"i":2,"is_event":true,"offering":"a brunch with a drag show","primary":"Food & Drink","secondary":"Theater","secondary_element":"a drag show between courses","basis":"stated_in_text"},
+{"i":3,"is_event":true,"offering":"a charity benefit","primary":"Community","secondary":"","secondary_element":"","basis":"stated_in_text"},
+{"i":4,"is_event":true,"offering":"a pub quiz","primary":"Social","secondary":"","secondary_element":"","basis":"stated_in_text"},
+{"i":5,"is_event":true,"offering":"unclear","primary":"Social","secondary":"","secondary_element":"","basis":"guess"},
+{"i":6,"is_event":false,"offering":"a parking pass","primary":"Community","secondary":"","secondary_element":"","basis":"stated_in_text"},
+{"i":7,"is_event":true,"offering":"a growers market","primary":"Markets","secondary":"Music","secondary_element":"a local band playing on the lawn","basis":"stated_in_text"},
+{"i":8,"is_event":true,"offering":"a DJ set of nineties music","primary":"Music","secondary":"","secondary_element":"","basis":"stated_in_text"},
+{"i":9,"is_event":true,"offering":"a storytelling and ministry talk","primary":"Talks","secondary":"","secondary_element":"","basis":"stated_in_text"},
+{"i":10,"is_event":true,"offering":"a sewing social club","primary":"Social","secondary":"","secondary_element":"","basis":"stated_in_text"}]"""
 
 # ---------------------------------------------------------------------------
-# GOLDEN SET: every case we reasoned through, plus the ones that burned us.
+# GOLDEN: real cases, HELD OUT (nothing here appears in the examples).
 # (name, venue, description, expected_primary, expected_is_event)
-# expected_primary None means "anything, but confidence must be BELOW the floor"
+#   expected_primary None + is_event True  -> must abstain (basis "guess")
+#   expected_is_event False                -> must be rejected as not-an-event
 GOLDEN = [
+    # bare artist names at rooms whose names suggest something else
     ("Vince Gill: 50 Years From Home", "Au-Rene Theater", "", "Music", True),
     ("Sara Bareilles", "Bill Graham Civic Auditorium", "An evening with Sara Bareilles.", "Music", True),
-    ("Alter Bridge with Big Wreck", "Roseland Theater", "A concert featuring Alter Bridge alongside Big Wreck at the Roseland Theater in Portland.", "Music", True),
-    ("Luenell", "Cobb's Comedy Club", "Experience the magic of Luenell at Cobb's Comedy Club.", "Comedy", True),
-    ("Aida Rodriguez", "The Main Room", "Tonight at the Improv featuring Aida Rodriguez.", "Comedy", True),
     ("Boosie & Webbie", "Winspear Opera House", "Join Boosie & Webbie for a celebration.", "Music", True),
+    ("Alter Bridge with Big Wreck", "Roseland Theater", "A concert featuring Alter Bridge alongside Big Wreck at the Roseland Theater in Portland.", "Music", True),
+    # a non-musician touring a theatre: v1 called this Music at 0.85
+    ("Dante Gebel - Dallas", "Majestic Theatre - Dallas", "Dante Gebel live in Dallas.", "Talks", True),
+    # comedians in a room whose name says comedy (must NOT be suppressed by the venue rule)
+    ("Luenell", "Cobb's Comedy Club", "Experience the magic of Luenell at Cobb's Comedy Club.", "Comedy", True),
+    ("Marc Maron Tickets", "Chevalier Theatre", "", "Comedy", True),
+    # a charity renting a comedy room
+    ("Boys & Girls Club Annual Fundraiser", "Cobb's Comedy Club", "An evening supporting Boys & Girls Club of America programs for local kids.", "Community", True),
+    # stage
     ("Mean Girls the Musical", "Gerry Frank Amphitheater", "The hit Broadway musical comes to town.", "Theater", True),
     ("State Ballet of Georgia - Swan Lake", "London Coliseum", "", "Dance", True),
-    ("Baby Storytime", "Park Hill Branch Library", "Stories and songs for babies and their caregivers.", "Family", True),
+    ("Crystal Methyd", "Hal's", "An evening with Crystal Methyd.", "Theater", True),
+    # container vs element
     ("Port Townsend Farmers Market", "Downtown Port Townsend", "Local organic produce, accompanied by live music.", "Markets", True),
-    ("Chalant Matcha Pop-Up", "Paper Son Coffee", "A matcha pop-up at Paper Son Coffee.", "Food & Drink", True),
+    # venue services must be stripped, in BOTH fields
+    ("How to See Like a Photographer", "Times Ten Cellars", "A lecture on photographic seeing. Wine available for purchase.", "Talks", True),
+    ("Cornhole League", "Benny Boy Brewing", "A weekly cornhole league. Beer and food available at the bar.", "Sports", True),
+    ("First Fridays at Five", "Persip Park", "A free outdoor community concert series. Food trucks on site.", "Music", True),
+    # food IS the offering
     ("Bucketlisters Wine Tasting Experience", "City Winery", "Experience a unique wine tasting.", "Food & Drink", True),
+    ("Chalant Matcha Pop-Up", "Paper Son Coffee", "A matcha pop-up at Paper Son Coffee.", "Food & Drink", True),
+    # tribute act
+    ("Rhapsody: The Music of Queen", "The Colonial Theatre", "A tribute to Queen's greatest hits.", "Music", True),
+    # social
+    ("Speed Dating Ages 30-45", "The Alembic", "Meet up to 12 singles in one night. Drinks available for purchase.", "Social", True),
+    # family / wellness / arts
+    ("Baby Storytime", "Park Hill Branch Library", "Stories and songs for babies and their caregivers.", "Family", True),
     ("Yoga in the Park", "Laurelhurst Park", "", "Wellness", True),
     ("UPTOWN POETRY SLAM", "Green Mill Jazz Club", "A poetry slam event taking place weekly.", "Arts", True),
-    ("73rd Annual Robin Hood Festival", "Old Town Sherwood", "Featuring the selection of the Maid Marian and the International Archery Match.", "Community", True),
-    ("Speed Dating Ages 30-45", "The Alembic", "Meet up to 12 singles in one night. Drinks available for purchase.", "Social", True),
-    ("Silent Book Club", "Ruby Coffee", "Bring a book, read in company, chat after. Coffee and pastries for sale.", "Social", True),
-    ("Rhapsody: The Music of Queen", "The Colonial Theatre", "A tribute to Queen's greatest hits.", "Music", True),
+    # convention/expo now has a home
+    ("Godzillafest 2026", "Holiday Inn San Francisco", "A Godzilla fan convention with guests, panels and dealers.", "Talks", True),
+    # not events
     ("AirOtic Soiree - Gift Card", "Secret Location", "Gift card for AirOtic Soiree.", None, False),
     ("Shuttle to Lil Wayne", "Bus Depot", "Round-trip shuttle service to the Lil Wayne concert.", None, False),
+    # must abstain: no information exists
     ("Puppy Pool Party", "Southeast Community Center", "", None, True),
+    ("Chanpan", "Polaris Hall", "", None, True),
 ]
 
 
 def call(batch):
-    """One classification request. Returns {i: obj} or None on failure."""
     lines = []
     for i, (name, venue, desc) in enumerate(batch, 1):
         d = re.sub(r"\s+", " ", desc or "")[:220]
@@ -269,23 +305,20 @@ def call(batch):
 
 
 def label_of(o):
-    """Apply OUR abstain rule. The model never returns 'Event'; we assign it."""
+    """OUR abstain rule. The model never returns 'Event'; we assign it."""
     if not o:
         return "(no answer)"
     if not o.get("is_event", True):
         return "(not an event)"
     p = str(o.get("primary") or "").strip()
     if p not in CATEGORIES:
-        return "Event"            # unknown label -> never written through
-    try:
-        c = float(o.get("confidence", 0))
-    except Exception:
-        c = 0.0
-    return "Event" if c < CONF_FLOOR else p
+        return "Event"
+    if str(o.get("basis") or "").strip() not in ACCEPT_BASIS:
+        return "Event"
+    return p
 
 
 def run(rows):
-    """rows: list of (name, venue, desc). Returns list of result objects."""
     res = []
     for s in range(0, len(rows), BATCH):
         chunk = rows[s:s + BATCH]
@@ -298,33 +331,34 @@ def run(rows):
 
 def main():
     print("=" * 78)
-    print(f"EVAL — model={MODEL}  confidence floor={CONF_FLOOR}  (writes nothing)")
+    print(f"EVAL v2 — model={MODEL}")
+    print(f"accepted bases={sorted(ACCEPT_BASIS)}  (anything else -> Event)")
+    print("writes nothing, anywhere")
     print("=" * 78)
 
-    # ---------------- GOLDEN ----------------
-    print(f"\nGOLDEN SET ({len(GOLDEN)} cases with known answers)\n")
+    print(f"\nGOLDEN SET ({len(GOLDEN)} held-out cases with known answers)\n")
     results = run([(n, v, d) for n, v, d, _, _ in GOLDEN])
     passed = 0
     for (name, venue, desc, want, want_ev), o in zip(GOLDEN, results):
         got = label_of(o)
-        conf = float(o.get("confidence", 0)) if o else 0.0
+        basis = (o or {}).get("basis", "?")
         if not want_ev:
             ok = (o is not None and not o.get("is_event", True))
+            wanted = "NOT-EVENT"
         elif want is None:
-            ok = (conf < CONF_FLOOR)          # must abstain
+            ok = (got == "Event")
+            wanted = "ABSTAIN"
         else:
             ok = (got == want)
+            wanted = want
         passed += ok
         sec = (o or {}).get("secondary") or ""
-        secel = (o or {}).get("secondary_element") or ""
-        print(f"{'PASS' if ok else 'FAIL'}  {name[:36]:38} -> {got:13} "
-              f"conf={conf:.2f}  want={want if want else ('NOT-EVENT' if not want_ev else 'ABSTAIN')}")
-        print(f"      offering: {(o or {}).get('offering','?')}")
-        if sec:
-            print(f"      secondary: {sec}  <- {secel}")
+        print(f"{'PASS' if ok else 'FAIL'}  {name[:34]:36} -> {got:13} "
+              f"basis={basis:14} want={wanted}")
+        print(f"      offering: {(o or {}).get('offering','?')}"
+              f"{('   secondary: ' + sec + ' <- ' + ((o or {}).get('secondary_element') or '')) if sec else ''}")
     print(f"\nGOLDEN: {passed}/{len(GOLDEN)}")
 
-    # ---------------- REAL SAMPLE ----------------
     print(f"\n{'=' * 78}\nREAL ROWS currently labeled 'Event' (sample of {SAMPLE_N})\n")
     try:
         data = requests.get(EVENTS_JSON, timeout=60).json()
@@ -343,15 +377,17 @@ def main():
         pool.append((str(r.get("event_name", "")), str(r.get("venue", "")),
                      str(r.get("description", ""))))
     step = max(1, len(pool) // SAMPLE_N)
-    sample = pool[::step][:SAMPLE_N]          # spread across the file, not the first N
+    sample = pool[::step][:SAMPLE_N]
     print(f"(pool of {len(pool)} unique Event rows; sampling every {step})\n")
 
     out = run(sample)
-    counts, rescued, abstained, notevent = {}, 0, 0, 0
+    counts, bases = {}, {}
+    rescued = abstained = notevent = 0
     for (name, venue, desc), o in zip(sample, out):
         lab = label_of(o)
-        conf = float(o.get("confidence", 0)) if o else 0.0
+        b = (o or {}).get("basis", "?")
         counts[lab] = counts.get(lab, 0) + 1
+        bases[b] = bases.get(b, 0) + 1
         if lab == "Event":
             abstained += 1
         elif lab == "(not an event)":
@@ -359,17 +395,20 @@ def main():
         elif lab != "(no answer)":
             rescued += 1
         sec = (o or {}).get("secondary") or ""
-        print(f"{lab:14} {conf:.2f}  {name[:40]:42} @ {venue[:20]:22}"
+        print(f"{lab:14} {b:14} {name[:38]:40} @ {venue[:18]:20}"
               f"{('  +' + sec) if sec else ''}")
         print(f"               offering: {(o or {}).get('offering','?')}")
 
     n = len(sample)
     print(f"\n{'=' * 78}\nSAMPLE RESULT on {n} rows that are 'Event' today:")
     print(f"  rescued into a real category : {rescued}  ({rescued / n * 100:.0f}%)")
-    print(f"  still Event (low confidence) : {abstained}  ({abstained / n * 100:.0f}%)")
+    print(f"  still Event (honest guess)   : {abstained}  ({abstained / n * 100:.0f}%)")
     print(f"  rejected as not-an-event     : {notevent}")
-    print("\n  breakdown:")
+    print("\n  category breakdown:")
     for k, v in sorted(counts.items(), key=lambda x: -x[1]):
+        print(f"    {k:16} {v}")
+    print("\n  basis breakdown (is it calibrated? 'guess' should not be 0):")
+    for k, v in sorted(bases.items(), key=lambda x: -x[1]):
         print(f"    {k:16} {v}")
     print("\nNothing was written. Read the rows above and tell me what is wrong.")
 
