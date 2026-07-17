@@ -297,6 +297,85 @@ def infer_category(name, venue, genres, description):
     return best
 
 
+# ---------- MusicBrainz artist lookup (free, no key, 1 req/sec) ----------
+#
+# Recovers artist-name-only events ("Arlo Parks", "SOFI TUKKER at Warfield")
+# that the keyword inferrer honestly leaves in "Event" because nothing in the
+# text says music. Same refuse-over-wrong rules as geocoding:
+#   - only clean 2+ word candidate names are queried (one common word like
+#     "Sunrise" will exact-match some obscure artist and lie)
+#   - the MusicBrainz match must be EXACT (score 100 + normalized-name equal)
+#   - the artist must carry at least one genre/tag (a bare name row in their
+#     database is not evidence the event is a concert)
+# Results cache to mb_artists.json (hits AND misses), so each artist costs one
+# request ever. Per-run lookups are capped; the backlog converges over runs.
+
+MB_CACHE_NAME = "mb_artists.json"
+MB_CAP = 300          # max fresh lookups per run (~6 min at 1.1s each)
+MB_UA = {"User-Agent": "GrooveSeeker/1.0 (https://gsv3.ai)"}
+
+# Trailing junk stripped from names before treating them as artist candidates.
+_MB_SPLIT_RE = re.compile(
+    r"\s+(?:at|@|w/|with|ft\.?|feat\.?|featuring|presents?|live at|live in|in concert)\s+.*$"
+    r"|\s+\d{1,3}(?:st|nd|rd|th)\s+anniversary\b.*$"
+    r"|\s+(?:anniversary|world|farewell|reunion|north american)\s+tour\b.*$"
+    r"|\s+tour\s*(?:20\d\d)?$"
+    r"|\s*[|•~:].*$|\s+-\s+.*$|\s*\(.*\)\s*$", re.I)
+
+def _mb_candidate(name):
+    """Reduce an event name to a plausible artist name, or "" to skip."""
+    n = _MB_SPLIT_RE.sub("", (name or "").strip()).strip(" -–,")
+    toks = norm_text(n).split()
+    if len(toks) < 2 or len(toks) > 6: return ""   # 1-word names are match-bait
+    if any(t.isdigit() and len(t) == 4 for t in toks): return ""  # years = tour titles
+    return n
+
+def _mb_lookup(name):
+    """One artist search. Returns genre string on a proven match, "" otherwise."""
+    q = 'artist:"' + name.replace('"', "") + '"'
+    r = requests.get("https://musicbrainz.org/ws/2/artist/",
+                     params={"query": q, "fmt": "json", "limit": 1},
+                     headers=MB_UA, timeout=15)
+    if r.status_code != 200: return None   # None = transient failure, retry later
+    arts = (r.json() or {}).get("artists") or []
+    if not arts: return ""
+    a = arts[0]
+    if int(a.get("score", 0)) < 100: return ""
+    if norm_text(a.get("name")) != norm_text(name): return ""
+    tags = [t.get("name", "") for t in (a.get("tags") or []) if t.get("name")]
+    if not tags: return ""
+    return tags[0]
+
+def enrich_artists(all_rows):
+    """Second pass over rows still in "Event": exact artist match -> Music.
+    The matched genre is kept in the cache for the future subcategory feature."""
+    cache = _load_json_map(MB_CACHE_NAME, {})
+    looked, matched, hits = 0, 0, 0
+    for r in all_rows:
+        if (r.get("category") or "").strip() != "Event": continue
+        cand = _mb_candidate(r.get("event_name"))
+        if not cand: continue
+        key = norm_text(cand)
+        if key in cache:
+            if cache[key].get("genre"):
+                r["category"] = "Music"; hits += 1
+            continue
+        if looked >= MB_CAP: continue
+        try:
+            genre = _mb_lookup(cand)
+        except Exception:
+            genre = None
+        time.sleep(1.1)
+        looked += 1
+        if genre is None: continue          # transient failure: not cached, retried next run
+        cache[key] = {"genre": genre}       # "" caches a proven miss
+        if genre:
+            r["category"] = "Music"; matched += 1
+    _save_json_map(MB_CACHE_NAME, cache)
+    print(f"artists: {looked} looked up, {matched} new matches, {hits} cache hits -> Music")
+    return matched + hits
+
+
 def recategorize_all(all_rows):
     """Recompute `category` for EVERY row, existing and new, on every run.
 
@@ -1222,8 +1301,10 @@ def main():
     # Must run AFTER geocode (needs venue coords) and BEFORE publish/push, so the
     # local wall clock is what lands in events.json and the CSV.
     localize_times(all_rows)
-    # Recompute categories across the whole set so old rows heal too.
+    # Recompute categories across the whole set so old rows heal too, then
+    # recover artist-name-only concerts via MusicBrainz (cached, capped).
     recategorize_all(all_rows)
+    enrich_artists(all_rows)
     upcoming = publish_json(all_rows)
     push_csv(all_rows, sha)
     update_domain_stats(new_rows, quarantine, {id(r) for r in all_rows})
