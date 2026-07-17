@@ -243,12 +243,14 @@ CATEGORY_DEFINITIONAL = {
   "Theater":      ["musical","opera","cabaret","burlesque","pantomime"],
   "Sports":       ["rodeo","marathon","5k","10k","fun run","regatta"],
   "Markets":      ["farmers market","flea market","craft fair","swap meet","bazaar","flohmarkt","vendor market"],
-  "Food & Drink": ["food truck","tasting","brewery","distillery","winery","ribfest","food festival","bbq"],
+  "Food & Drink": ["food truck","tasting","brewery","distillery","winery","ribfest","food festival","food fest","bbq"],
   "Talks":        ["lecture","keynote","seminar","symposium","book club","author talk"],
   "Family":       ["storytime","story time"],
   "Arts":         ["exhibition","exhibit","art show","art fair","poetry"],
   "Nightlife":    ["nightclub","dj set","rave","club night","after party","techno","house music"],
-  "Music":        ["concert","concerts","live music","symphony","orchestra","philharmonic","recital","choir","quartet"],
+  "Music":        ["concert","concerts","live music","music","symphony","orchestra","philharmonic","recital","choir","quartet",
+                   "jazz","blues","bluegrass","reggae","hip-hop","punk rock","heavy metal","indie rock","edm","dj set","songwriter","tribute to"],
+  "Markets":      ["farmers market","flea market","craft fair","swap meet","bazaar","vendor market","market"],
   "Community":    ["fundraiser","parade","street fair"],
 }
 
@@ -256,6 +258,50 @@ _DEF_PATTERNS = {
     cat: [re.compile(r"\b" + re.escape(k) + r"\b") for k in kws]
     for cat, kws in CATEGORY_DEFINITIONAL.items()
 }
+
+# Words that appear in VENUE names but predict nothing, because these venues
+# host everything: a "Theater" hosts rock, comedy and ballet; an "Auditorium"
+# hosts all of the above plus graduations. Their venue hits are ignored so a
+# venue's name can never decide a category by itself. Specific-use venue words
+# (comedy club, brewery, museum, library) are NOT here: those genuinely predict.
+# Terms a DESCRIPTION may prove a category with. Far narrower than the name
+# list: a blurb saying "music" proves nothing (almost all of them do, which is
+# how a French street market got tagged Music), but "A concert featuring..."
+# states what the event actually is.
+CATEGORY_DEFINITIONAL_DESC = {
+  "Music":        ["concert","concerts","live music performance"],
+  "Comedy":       ["comedians","comedy show","stand-up comedy","standup comedy"],
+  "Film":         ["screening","film screening"],
+  "Theater":      ["stage production"],
+  "Markets":      ["farmers market","flea market"],
+  "Family":       ["storytime","story time","playgroup","toddler","toddlers"],
+}
+
+_DEF_DESC_PATTERNS = {
+    cat: [re.compile(r"\b" + re.escape(k) + r"\b") for k in kws]
+    for cat, kws in CATEGORY_DEFINITIONAL_DESC.items()
+}
+
+# The opposite of the stopwords: venue phrases that ARE single-use enough to
+# decide on their own. A room with "Comedy" in its name hosts comedy; a cinema
+# shows films. Deliberately tiny, because most venues host anything.
+CATEGORY_DEFINITIONAL_VENUE = {
+  "Comedy":    ["comedy"],
+  "Film":      ["cinema","cineplex","movie theater","drive-in"],
+  "Nightlife": ["nightclub"],
+  "Music":     ["music hall","concert hall","jazz club"],
+  "Wellness":  ["yoga studio","wellness center"],
+}
+
+_DEF_VENUE_PATTERNS = {
+    cat: [re.compile(r"\b" + re.escape(k) + r"\b") for k in kws]
+    for cat, kws in CATEGORY_DEFINITIONAL_VENUE.items()
+}
+
+VENUE_STOPWORD_RE = re.compile(
+    r"\b(theater|theatre|auditorium|amphitheat(?:er|re)|arena|coliseum|stadium|"
+    r"hall|center|centre|pavilion|plaza|park|room|stage|garden|casino|civic|"
+    r"memorial|field|bowl|dome|complex|venue|space|studios?)\b", re.I)
 
 
 def infer_category(name, venue, genres, description):
@@ -280,13 +326,47 @@ def infer_category(name, venue, genres, description):
     d = f"{genres or ''} {description or ''}".lower()
     best, best_score, second_score = "Event", 0, 0
     for cat, pats in _CAT_PATTERNS.items():
-        score, hits = 0, 0
+        score = 0
+        spans = {"n": [], "v": [], "d": []}
         for p in pats:
-            if p.search(n): score += 5; hits += 1
-            if p.search(v): score += 2; hits += 1
-            if p.search(d): score += 1; hits += 1
-        definitional = any(p.search(n) for p in _DEF_PATTERNS.get(cat, []))
-        if not definitional and hits < 2:
+            hit_n, hit_v, hit_d = p.search(n), p.search(v), p.search(d)
+            # A generic venue word (Theater, Auditorium, Civic...) says nothing
+            # about what is happening inside it.
+            if hit_v and VENUE_STOPWORD_RE.fullmatch(hit_v.group(0)):
+                hit_v = None
+            if hit_n: score += 5; spans["n"].append(hit_n.span())
+            if hit_v: score += 2; spans["v"].append(hit_v.span())
+            if hit_d: score += 1; spans["d"].append(hit_d.span())
+        # Count INDEPENDENT evidence, not raw matches. Two things fake
+        # corroboration and both have burned us:
+        #   - the same word in two fields (descriptions echo venue names:
+        #     "...at the Roseland Theater"), and
+        #   - two overlapping keywords on the same words ("music" and "live
+        #     music" both hit one phrase), which put a food festival in Music.
+        # So: merge overlapping spans within a field, then count distinct
+        # matched TEXT across fields.
+        seen_text = set()
+        for field, text in (("n", n), ("v", v), ("d", d)):
+            merged = []
+            for s, e in sorted(spans[field]):
+                if merged and s < merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+                else:
+                    merged.append((s, e))
+            for s, e in merged:
+                seen_text.add(text[s:e].strip())
+        distinct = len(seen_text)
+        # A definitional term proves the category on its own, and must carry
+        # weight: "food fest" proved Food & Drink but scored 0 and so could
+        # never win. Definitional matches now floor the score by field.
+        definitional = False
+        if any(p.search(n) for p in _DEF_PATTERNS.get(cat, [])):
+            definitional = True; score = max(score, 5)
+        if any(p.search(v) for p in _DEF_VENUE_PATTERNS.get(cat, [])):
+            definitional = True; score = max(score, 2)
+        if any(p.search(d) for p in _DEF_DESC_PATTERNS.get(cat, [])):
+            definitional = True; score = max(score, 1)
+        if not definitional and distinct < 2:
             continue  # one ambiguous signal never decides
         if score > best_score:
             best, best_score, second_score = cat, score, best_score
