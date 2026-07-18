@@ -100,6 +100,18 @@ Everything in STEP 2 and STEP 3 applies here too. The venue, its name, its usual
 programming, its ordinary services, the neighbourhood, and the mood are never
 elements, and never secondaries. Never fill the field just because it exists.
 
+A NAME IS NOT A DESCRIPTION
+An event's name is a name. Acts choose names that are vivid, playful or
+descriptive, and those names routinely describe activities the act has nothing
+to do with. A name that reads like an activity is not evidence that the activity
+is happening. Any name that could plausibly BE the name of a band, DJ, comedian
+or production is exactly as likely to be that as it is to be the thing it
+literally describes.
+So a name alone, with no description saying what happens and no act you
+recognise, supports nothing: that is "guess". Do not read the words of a name as
+a summary of the event unless the text elsewhere confirms it, or the phrasing is
+plainly a description of an activity rather than a title.
+
 DISTRACTORS - THE OFFERING DECIDES, MODIFIERS DESCRIBE
 One word never flips a category. An adjective about the mood of a performance
 describes it; it does not change what the performance is.
@@ -203,7 +215,15 @@ EXAMPLES_USER = """Classify these events:
 
 11. NAME: Wrenfield Gray
    VENUE: 
-   ABOUT: """
+   ABOUT: 
+
+12. NAME: Kittens In The Bathtub
+   VENUE: Halyard Rooms
+   ABOUT: 
+
+13. NAME: Kittens In The Bathtub
+   VENUE: Halyard Rooms
+   ABOUT: A drop-in afternoon for families to meet and play with foster kittens."""
 
 EXAMPLES_ASSISTANT = """[{"i":1,"is_event":true,"offering":"the band's set","primary":"Music","secondary":"","secondary_element":"","basis":"inferred"},
 {"i":2,"is_event":true,"offering":"a brunch with a drag show","primary":"Food & Drink","secondary":"Theater","secondary_element":"a drag show between courses","basis":"stated_in_text"},
@@ -215,7 +235,9 @@ EXAMPLES_ASSISTANT = """[{"i":1,"is_event":true,"offering":"the band's set","pri
 {"i":8,"is_event":true,"offering":"a DJ set of nineties music","primary":"Music","secondary":"","secondary_element":"","basis":"stated_in_text"},
 {"i":9,"is_event":true,"offering":"a storytelling and ministry talk","primary":"Talks","secondary":"","secondary_element":"","basis":"stated_in_text"},
 {"i":10,"is_event":true,"offering":"a sewing social club","primary":"Social","secondary":"","secondary_element":"","basis":"stated_in_text"},
-{"i":11,"is_event":true,"offering":"unclear","primary":"Music","secondary":"","secondary_element":"","basis":"guess"}]"""
+{"i":11,"is_event":true,"offering":"unclear","primary":"Music","secondary":"","secondary_element":"","basis":"guess"},
+{"i":12,"is_event":true,"offering":"unclear","primary":"Family","secondary":"","secondary_element":"","basis":"guess"},
+{"i":13,"is_event":true,"offering":"a foster kitten meet-and-play","primary":"Family","secondary":"","secondary_element":"","basis":"stated_in_text"}]"""
 
 # ---------------------------------------------------------------------------
 # GOLDEN: real cases, HELD OUT (nothing here appears in the examples).
@@ -268,6 +290,10 @@ GOLDEN = [
     # row has no venue and no description. Missing data is not merchandise.
     # It may honestly abstain on the category; it must never be deleted.
     ("Zach Top", "", "", None, True),
+    # Same shape as Puppy Pool Party: an evocative name, no description. These
+    # are real acts, and the model has called near-identical rows both ways.
+    ("Show Me The Body", "The Fonda Theatre", "", None, True),
+    ("Horse Jumper of Love in Los Angeles", "The Regent Theater", "", None, True),
 ]
 
 
