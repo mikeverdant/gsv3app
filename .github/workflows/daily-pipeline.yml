@@ -23,4 +23,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           LOCATIONIQ_KEY: ${{ secrets.LOCATIONIQ_KEY }}
+          # Optional. If this is ever missing the AI category pass prints
+          # "skipped" and the keyword labels stand: the run still succeeds.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python pipeline.py
