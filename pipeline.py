@@ -23,11 +23,20 @@ DAILY_GEOCODE_LIMIT = 4500
 
 APP_COLUMNS = ["featured","date","start_time","event_name","venue","venue_address",
                "venue_lat","venue_lng","venue_notes","venue_map_status","region",
-               "url","category","price","description"]
+               "url","category","price","description",
+               # category_secondary: a real element inside the event, when one
+               #   exists. Usually blank. The card never shows it; it only widens
+               #   what a filter catches.
+               # category_source: WHO decided the category. This exists so a
+               #   wrong label is looked up, never guessed at: keyword | ai:v1 |
+               #   musicbrainz | ai:v1+mb. Costs nothing, ends the guessing.
+               "category_secondary","category_source"]
 
 GITHUB_TOKEN = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 LOCATIONIQ_KEY = os.environ.get("LOCATIONIQ_KEY")
+# Optional. Absent -> the AI pass no-ops and keyword labels stand. Never fatal.
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 missing = [n for n, v in [("GITHUB_TOKEN/GH_TOKEN", GITHUB_TOKEN),
                           ("SUPABASE_SERVICE_KEY", SUPABASE_KEY),
                           ("LOCATIONIQ_KEY", LOCATIONIQ_KEY)] if not v]
@@ -223,6 +232,7 @@ CATEGORY_KEYWORDS = {
   "Nightlife":    ["nightclub","nightlife","dj set","rave","techno","house music","late night","club night","after party"],
   "Music":        ["music","concert","concerts","live music","band","bands","jazz","blues","bluegrass","acoustic","hip-hop","orchestra","choir","symphony","recital","quartet","dj","gig","songwriter","metal","rock","punk","indie","country","folk","electronic","edm","rap","r&b","soul","funk","reggae","classical","pop","tribute","ensemble","philharmonic","tour","album"],
   "Community":    ["fundraiser","benefit","nonprofit","volunteer","civic","heritage","meetup","meet-up","parade","rally","festival","street fair"],
+  "Social":       ["trivia","pub quiz","quiz night","speed dating","singles night","game night","board game","board games","mixer","social club","networking","meet new people"],
 }
 
 _CAT_PATTERNS = {
@@ -246,6 +256,7 @@ CATEGORY_DEFINITIONAL = {
   "Food & Drink": ["food truck","tasting","brewery","distillery","winery","ribfest","food festival","food fest","bbq"],
   "Talks":        ["lecture","keynote","seminar","symposium","book club","author talk"],
   "Family":       ["storytime","story time"],
+  "Social":       ["trivia","pub quiz","quiz night","speed dating","singles night","game night","board games"],
   "Arts":         ["exhibition","exhibit","art show","art fair","poetry"],
   "Nightlife":    ["nightclub","dj set","rave","club night","after party","techno","house music"],
   "Music":        ["concert","concerts","live music","music","symphony","orchestra","philharmonic","recital","choir","quartet",
@@ -377,6 +388,351 @@ def infer_category(name, venue, genres, description):
     return best
 
 
+# ---------- AI category pass ----------
+#
+# The keyword inferrer refuses rather than guess, so it leaves artist-name-only
+# events in "Event". No keyword table fixes that: the event's type lives in
+# knowledge about the performer, not in the words on the row.
+#
+# This prompt is BYTE-IDENTICAL to the one proven by eval_categories.py, which
+# scored 30/30 on held-out cases including the traps that burned us (a preacher
+# touring a theatre, a charity renting a comedy club, real bands with empty
+# rows). Do not edit it here. Edit the eval, prove it, then copy it across.
+#
+# Fail-isolation: this pass only ever UPGRADES rows the keyword pass left as
+# "Event". No key, dead API, bad JSON, or an off-taxonomy label all leave the
+# keyword label untouched and the run finishes.
+
+AI_CACHE_NAME = "ai_categories.json"
+AI_MODEL = "claude-haiku-4-5-20251001"
+AI_BATCH = 20
+AI_MAX_CALLS = 400          # per run; the cache makes later runs nearly free
+AI_URL = "https://api.anthropic.com/v1/messages"
+
+# Bases we act on. "guess" is an honest refusal and falls through to
+# MusicBrainz, then stays "Event". Retunable here with no re-calling: the basis
+# is cached per event.
+AI_ACCEPT_BASIS = {"known_act", "stated_in_text", "inferred"}
+
+AI_CATEGORIES = ["Music","Comedy","Theater","Film","Arts","Dance","Talks",
+                 "Food & Drink","Markets","Nightlife","Community","Family",
+                 "Sports","Wellness","Social"]
+
+AI_SYSTEM = """ou classify live events for a discovery app. People use it to decide what to go do.
+
+Work the steps. Do not jump to a label.
+
+STEP 1 - IS IT AN EVENT? (default YES)
+An event is something happening at a time and place that people gather for.
+Set is_event false ONLY when the text POSITIVELY says the listing is a product
+rather than a gathering: a gift card, a parking or camping pass, transport to an
+event, merchandise. The text must say so.
+Missing information is NOT evidence. A bare name with no venue and no
+description is an event we know little about, not a non-event. When in doubt,
+is_event is true: a wrongly deleted event can never be found by anyone, while a
+poorly labelled one still exists.
+Private, invite-only, members-only and sold-out things ARE events. Being hard to
+get into is not the same as not existing. Never exclude them.
+
+STEP 2 - THE VENUE IS NOT THE EVENT
+What a venue routinely does tells you NOTHING about what any single event there
+is. Any room can be rented by anyone for anything. A room that usually hosts one
+kind of act will host a completely different kind next week, and a room with a
+word in its name does not make that word the category. Never reason from what
+the venue normally does, or from what its name suggests.
+Judge only what the text says is happening at THIS event.
+
+STEP 3 - THE VENUE'S ORDINARY SERVICES ARE NOT THE EVENT
+Anything the venue sells or does anyway, that an attendee could simply decline
+and still have the full experience they came for, is not part of the event and
+never a category. If it is optional, it is the venue.
+Food or drink is a category only when it IS the thing being offered, or when it
+is bundled into the price so an attendee cannot decline it.
+
+STEP 4 - NAME THE OFFERING
+In a few words: what is the attendee going FOR? Not everything mentioned in the
+text. The thing itself.
+
+STEP 5 - PRIMARY IS WHAT SURVIVES CANCELLATION
+When two things are genuinely bundled, ask: if one were cancelled, would the
+other still happen?
+- The one that still happens is the base, and the base is PRIMARY.
+- If cancelling it leaves no event at all, it is PRIMARY.
+Worked through: an added performance inside a larger paid experience does not
+become the primary, because cancelling the performance leaves the experience
+intact. But a performance that IS the event has nothing left when cancelled, so
+it is primary.
+
+STEP 6 - SECONDARY IS RARE. MOST EVENTS HAVE NONE.
+Add a secondary ONLY if you can name a concrete element inside THIS event in a
+few words. If you cannot name the element, there is no secondary: leave both
+fields "".
+Everything in STEP 2 and STEP 3 applies here too. The venue, its name, its usual
+programming, its ordinary services, the neighbourhood, and the mood are never
+elements, and never secondaries. Never fill the field just because it exists.
+
+A NAME IS NOT A DESCRIPTION
+An event's name is a name. Acts choose names that are vivid, playful or
+descriptive, and those names routinely describe activities the act has nothing
+to do with. A name that reads like an activity is not evidence that the activity
+is happening. Any name that could plausibly BE the name of a band, DJ, comedian
+or production is exactly as likely to be that as it is to be the thing it
+literally describes.
+So a name alone, with no description saying what happens and no act you
+recognise, supports nothing: that is "guess". Do not read the words of a name as
+a summary of the event unless the text elsewhere confirms it, or the phrasing is
+plainly a description of an activity rather than a title.
+
+DISTRACTORS - THE OFFERING DECIDES, MODIFIERS DESCRIBE
+One word never flips a category. An adjective about the mood of a performance
+describes it; it does not change what the performance is.
+Descriptions are auto-generated and usually restate the name and venue padded
+with filler. Ignore filler. The words perform, live, show, experience and
+celebration carry no category meaning on their own.
+
+PERFORMERS AND WHO IS ACTUALLY PERFORMING
+Use your real knowledge of who a named act is, and classify by what that act
+actually does. Do not assume a name you do not recognise is a musician just
+because the listing looks like a gig. Writers, speakers, preachers, drag
+performers, dancers and comedians all tour and all play the same rooms as bands.
+A tribute or covers act is still the category of the performance being given,
+even though the performer is not the artist named.
+An act being MENTIONED is not that act performing. A performance built around
+other artists' work is the performance actually happening, not those artists.
+
+BASIS - be honest about how you know
+Report the basis for your primary:
+  "known_act"      - you recognise the named act/production and know what it does
+  "stated_in_text" - the text plainly says what kind of event it is
+  "inferred"       - the NAME or DESCRIPTION contains real evidence you reasoned
+                     from, beyond the bare fact that this is a listing
+  "guess"          - you are pattern-matching. You do not actually know.
+"inferred" is NOT a softer word for guess. If the only thing supporting your
+answer is the venue, or the venue's name, or simply that this looks like the
+kind of listing where such events happen, that is "guess". Reasoning from the
+venue is forbidden by STEP 2, so it can never be a basis for anything.
+Use "guess" whenever you do not genuinely know, including when an act name is
+unfamiliar and you are reading the format rather than the facts. Guessing is
+expected sometimes and reporting it honestly is correct and useful: a "guess" is
+handled safely downstream, a false "known_act" is not. Never label a basis
+stronger than it truly is.
+
+CATEGORIES - pick exactly one primary. There is no "unknown" option.
+Music        - a musical performance is the offering: concerts, gigs, DJ sets, tribute acts, orchestras, music festivals, music open mics
+Comedy       - stand-up, improv, sketch, a comedian's set
+Theater      - plays, musicals, opera, drag, burlesque, stage productions
+Film         - screenings, movie nights, film festivals
+Arts         - gallery shows, exhibitions, art walks, installations, poetry, literary readings
+Dance        - social dance nights, dance classes, ballet, dance performances
+Talks        - lectures, panels, author talks, conferences, conventions, expos, seminars, workshops, classes
+Food & Drink - food or drink IS the offering: tastings, food and drink festivals, bundled meals
+Markets      - farmers markets, craft fairs, flea markets, vendor markets, swap meets
+Nightlife    - club nights, raves, late-night parties where the scene itself is the draw
+Community    - fundraisers, galas, parades, civic and cultural festivals, pride, neighbourhood events, fairs
+Family       - programming aimed at children: storytimes, playgroups, kids' activities and camps
+Sports       - games, races, tournaments, matches, leagues, rodeos
+Wellness     - yoga, meditation, sound baths, fitness
+Social       - the offering is being among people or meeting them: trivia, meetups, game nights, speed dating, singles nights, mixers, social clubs
+
+OUTPUT
+A JSON array only. One object per input event, same order, no prose, no fences:
+[{"i":1,"is_event":true,"offering":"...","primary":"Music","secondary":"","secondary_element":"","basis":"known_act"}]"""
+
+AI_EXAMPLES_USER = """lassify these events:
+
+1. NAME: The Hollow Pines
+   VENUE: The Rusty Anchor
+   ABOUT: A hilarious and unforgettable night as The Hollow Pines perform live. Full bar and kitchen open till late.
+
+2. NAME: Sunday Drag Brunch
+   VENUE: Marigold Room
+   ABOUT: Bottomless mimosas and a full brunch menu, with a drag show performed between courses. $45 includes brunch.
+
+3. NAME: Northside Youth Trust Annual Benefit
+   VENUE: The Chuckle Hut Comedy Club
+   ABOUT: An evening supporting Northside Youth Trust's programs for local kids. Silent auction and dinner.
+
+4. NAME: Tuesday Quiz Night
+   VENUE: Ironworks Brewing Co
+   ABOUT: Weekly pub quiz. Teams of up to six. Beer and food available at the bar.
+
+5. NAME: Otter Splash Bash
+   VENUE: Meadowbrook Community Center
+   ABOUT: Otter Splash Bash is an event at Meadowbrook Community Center promising an unforgettable experience.
+
+6. NAME: Riverbend Blues Festival - PARKING PASS
+   VENUE: Riverbend Fairgrounds
+   ABOUT: Parking pass for the Riverbend Blues Festival.
+
+7. NAME: Saturday Growers Market
+   VENUE: Elmwood Park
+   ABOUT: Local produce, bread and flowers every Saturday morning, with live music from a local band on the lawn.
+
+8. NAME: Decades Night: A Tribute to the Grunge Era
+   VENUE: The Lantern Hall
+   ABOUT: A DJ spins nineties classics all night long.
+
+9. NAME: Marisol Vance
+   VENUE: The Foundry Room
+   ABOUT: An evening with Marisol Vance, who will share stories from her life and her years in ministry.
+
+10. NAME: Fernhill Sewing Circle
+   VENUE: Brightway Superstore
+   ABOUT: Come learn, improve your skills, or just socialize while you sew.
+
+11. NAME: Wrenfield Gray
+   VENUE: 
+   ABOUT: 
+
+12. NAME: Kittens In The Bathtub
+   VENUE: Halyard Rooms
+   ABOUT: 
+
+13. NAME: Kittens In The Bathtub
+   VENUE: Halyard Rooms
+   ABOUT: A drop-in afternoon for families to meet and play with foster kittens."""
+
+AI_EXAMPLES_ASSISTANT = """{"i":1,"is_event":true,"offering":"the band's set","primary":"Music","secondary":"","secondary_element":"","basis":"inferred"},
+{"i":2,"is_event":true,"offering":"a brunch with a drag show","primary":"Food & Drink","secondary":"Theater","secondary_element":"a drag show between courses","basis":"stated_in_text"},
+{"i":3,"is_event":true,"offering":"a charity benefit","primary":"Community","secondary":"","secondary_element":"","basis":"stated_in_text"},
+{"i":4,"is_event":true,"offering":"a pub quiz","primary":"Social","secondary":"","secondary_element":"","basis":"stated_in_text"},
+{"i":5,"is_event":true,"offering":"unclear","primary":"Social","secondary":"","secondary_element":"","basis":"guess"},
+{"i":6,"is_event":false,"offering":"a parking pass","primary":"Community","secondary":"","secondary_element":"","basis":"stated_in_text"},
+{"i":7,"is_event":true,"offering":"a growers market","primary":"Markets","secondary":"Music","secondary_element":"a local band playing on the lawn","basis":"stated_in_text"},
+{"i":8,"is_event":true,"offering":"a DJ set of nineties music","primary":"Music","secondary":"","secondary_element":"","basis":"stated_in_text"},
+{"i":9,"is_event":true,"offering":"a storytelling and ministry talk","primary":"Talks","secondary":"","secondary_element":"","basis":"stated_in_text"},
+{"i":10,"is_event":true,"offering":"a sewing social club","primary":"Social","secondary":"","secondary_element":"","basis":"stated_in_text"},
+{"i":11,"is_event":true,"offering":"unclear","primary":"Music","secondary":"","secondary_element":"","basis":"guess"},
+{"i":12,"is_event":true,"offering":"unclear","primary":"Family","secondary":"","secondary_element":"","basis":"guess"},
+{"i":13,"is_event":true,"offering":"a foster kitten meet-and-play","primary":"Family","secondary":"","secondary_element":"","basis":"stated_in_text"}]"""
+
+
+def _ai_key(r):
+    return f"{norm_text(r.get('event_name'))}|{norm_text(r.get('venue'))}"
+
+def _ai_call(batch):
+    """One batch. Returns {i: obj} or None on a transient failure."""
+    lines = []
+    for i, r in enumerate(batch, 1):
+        d = re.sub(r"\s+", " ", str(r.get("description") or ""))[:220]
+        lines.append(f'{i}. NAME: {r.get("event_name") or ""}\n   VENUE: {r.get("venue") or ""}\n   ABOUT: {d}')
+    body = {
+        "model": AI_MODEL,
+        "max_tokens": 4000,
+        # Not the default (1.0). At 1.0 the same event landed in two different
+        # categories inside one run, and answers get cached, so a coin flip
+        # would be frozen into the data permanently.
+        "temperature": 0,
+        "system": AI_SYSTEM,
+        "messages": [
+            {"role": "user", "content": AI_EXAMPLES_USER},
+            {"role": "assistant", "content": AI_EXAMPLES_ASSISTANT},
+            {"role": "user", "content": "Classify these events:\n\n" + "\n\n".join(lines)},
+        ],
+    }
+    headers = {"content-type": "application/json", "x-api-key": ANTHROPIC_KEY,
+               "anthropic-version": "2023-06-01"}
+    for attempt in range(3):
+        try:
+            resp = requests.post(AI_URL, headers=headers, json=body, timeout=120)
+        except Exception:
+            time.sleep(3 * (attempt + 1)); continue
+        if resp.status_code in (429, 500, 502, 503, 529):
+            time.sleep(5 * (attempt + 1)); continue
+        if resp.status_code != 200:
+            return None
+        text = "".join(b.get("text", "") for b in resp.json().get("content", [])
+                       if b.get("type") == "text").strip()
+        text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.I | re.M).strip()
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            m = re.search(r"\[.*\]", text, re.S)
+            if not m: return None
+            try: parsed = json.loads(m.group(0))
+            except Exception: return None
+        out = {}
+        for o in parsed if isinstance(parsed, list) else []:
+            try: out[int(o.get("i"))] = o
+            except Exception: continue
+        return out
+    return None
+
+
+def ai_categorize(all_rows):
+    """Upgrade rows the keyword pass left as 'Event'. Never touches the rest."""
+    if not ANTHROPIC_KEY:
+        print("ai: ANTHROPIC_API_KEY not set - skipped (keyword labels stand).")
+        return 0, []
+    cache = _load_json_map(AI_CACHE_NAME, {})
+
+    def apply(r, o):
+        """Returns True if this row got a real category out of the AI."""
+        if not o: return False
+        if not o.get("is_event", True):
+            return False
+        p = str(o.get("primary") or "").strip()
+        if p not in AI_CATEGORIES: return False
+        if str(o.get("basis") or "").strip() not in AI_ACCEPT_BASIS: return False
+        r["category"] = p
+        sec = str(o.get("secondary") or "").strip()
+        # A secondary is only real if the model could NAME the element. No name,
+        # no element: the field is not a form to complete.
+        if sec in AI_CATEGORIES and sec != p and str(o.get("secondary_element") or "").strip():
+            r["category_secondary"] = sec
+        r["category_source"] = "ai:v1"
+        return True
+
+    todo = []
+    for r in all_rows:
+        if (r.get("category") or "").strip() != "Event":
+            continue
+        k = _ai_key(r)
+        if k not in cache:
+            todo.append(r)
+
+    # One classification per distinct name+venue; residencies cost one call.
+    uniq = {}
+    for r in todo:
+        uniq.setdefault(_ai_key(r), r)
+    queue = list(uniq.values())[: AI_MAX_CALLS * AI_BATCH]
+
+    calls, failed = 0, 0
+    for s in range(0, len(queue), AI_BATCH):
+        if calls >= AI_MAX_CALLS: break
+        batch = queue[s: s + AI_BATCH]
+        res = _ai_call(batch); calls += 1
+        if res is None:
+            failed += 1
+            if failed >= 3:
+                print("ai: repeated API failures - stopping this run, cache kept.")
+                break
+            continue
+        for i, r in enumerate(batch, 1):
+            o = res.get(i)
+            if o: cache[_ai_key(r)] = o
+
+    # Apply the cache to every matching row, including ones we did not send.
+    resolved, not_event = 0, []
+    for r in all_rows:
+        if (r.get("category") or "").strip() != "Event":
+            continue
+        o = cache.get(_ai_key(r))
+        if not o: continue
+        # Only delete on POSITIVE evidence. A real touring artist was deleted in
+        # testing because his row was empty and the model guessed. Missing data
+        # is not merchandise, so a "guess" can never remove an event.
+        if not o.get("is_event", True) and str(o.get("basis")) == "stated_in_text":
+            not_event.append(r); continue
+        if apply(r, o): resolved += 1
+
+    _save_json_map(AI_CACHE_NAME, cache)
+    guesses = sum(1 for v in cache.values() if str(v.get("basis")) == "guess")
+    print(f"ai: {calls} calls, {len(queue)} sent, {resolved} labeled, "
+          f"{len(not_event)} not-events, {len(cache)} cached ({guesses} honest guesses)")
+    return resolved, not_event
+
+
 # ---------- MusicBrainz artist lookup (free, no key, 1 req/sec) ----------
 #
 # Recovers artist-name-only events ("Arlo Parks", "SOFI TUKKER at Warfield")
@@ -427,8 +783,12 @@ def _mb_lookup(name):
     return tags[0]
 
 def enrich_artists(all_rows):
-    """Second pass over rows still in "Event": exact artist match -> Music.
-    The matched genre is kept in the cache for the future subcategory feature."""
+    """Last pass, over rows still in "Event" after keywords AND the AI.
+
+    That residue is not random: it is overwhelmingly obscure or ambiguously
+    named acts, which is exactly the question MusicBrainz answers for free and
+    authoritatively. A miss here costs nothing now, so the strict exact-match
+    rule stays. The matched genre is kept in the cache for subcategories."""
     cache = _load_json_map(MB_CACHE_NAME, {})
     looked, matched, hits = 0, 0, 0
     for r in all_rows:
@@ -438,7 +798,9 @@ def enrich_artists(all_rows):
         key = norm_text(cand)
         if key in cache:
             if cache[key].get("genre"):
-                r["category"] = "Music"; hits += 1
+                r["category"] = "Music"
+                r["category_source"] = "musicbrainz"
+                hits += 1
             continue
         if looked >= MB_CAP: continue
         try:
@@ -450,7 +812,9 @@ def enrich_artists(all_rows):
         if genre is None: continue          # transient failure: not cached, retried next run
         cache[key] = {"genre": genre}       # "" caches a proven miss
         if genre:
-            r["category"] = "Music"; matched += 1
+            r["category"] = "Music"
+            r["category_source"] = "musicbrainz"
+            matched += 1
     _save_json_map(MB_CACHE_NAME, cache)
     print(f"artists: {looked} looked up, {matched} new matches, {hits} cache hits -> Music")
     return matched + hits
@@ -468,7 +832,15 @@ def recategorize_all(all_rows):
     counts = {}
     for r in all_rows:
         before = (r.get("category") or "").strip()
+        # Snapshot what this row looked like BEFORE anything touched it today.
+        # The change report reads this, so a surprising label gets looked up
+        # instead of theorised about.
+        r["_before_cat"] = before
+        r["_before_src"] = (r.get("category_source") or "").strip()
         after = infer_category(r.get("event_name"), r.get("venue"), "", r.get("description"))
+        # Recomputed from scratch every run, so provenance is recomputed too.
+        r["category_secondary"] = ""
+        r["category_source"] = "keyword" if after != "Event" else ""
         if after != before:
             r["category"] = after
             changed += 1
@@ -1370,6 +1742,62 @@ def push_csv(all_rows, sha):
     p.raise_for_status()
     print(f"Pushed CSV: {len(all_rows)} rows.")
 
+def write_change_report(all_rows, dropped_rows):
+    """Every category change this run, with WHO made it, as a CSV in storage.
+
+    Mike cannot read the code, so he must never be asked to diagnose it. When a
+    label looks wrong the answer is looked up here: the row shows what it was,
+    what it became, and which pass decided. No theories, no guess-and-check.
+    Best-effort: a failure here must never affect the data."""
+    try:
+        rows = []
+        for r in all_rows:
+            before = r.get("_before_cat", "")
+            after = (r.get("category") or "").strip()
+            if before == after and not r.get("category_secondary"):
+                continue
+            rows.append({
+                "date": r.get("date", ""),
+                "event_name": r.get("event_name", ""),
+                "venue": r.get("venue", ""),
+                "was": before,
+                "now": after,
+                "secondary": r.get("category_secondary", ""),
+                "decided_by": r.get("category_source", ""),
+                "was_decided_by": r.get("_before_src", ""),
+            })
+        for r in dropped_rows:
+            rows.append({
+                "date": r.get("date", ""), "event_name": r.get("event_name", ""),
+                "venue": r.get("venue", ""), "was": r.get("_before_cat", ""),
+                "now": "DROPPED-not-an-event", "secondary": "",
+                "decided_by": "ai:v1", "was_decided_by": r.get("_before_src", ""),
+            })
+        cols = ["date","event_name","venue","was","now","secondary","decided_by","was_decided_by"]
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for x in rows: w.writerow(x)
+        requests.post(f"{SUPABASE_URL}/storage/v1/object/{IMPORTS_BUCKET}/category_changes.csv",
+                      headers={**SB, "Content-Type": "text/csv", "x-upsert": "true"},
+                      data=buf.getvalue().encode())
+        by = {}
+        for x in rows: by[x["decided_by"] or "(none)"] = by.get(x["decided_by"] or "(none)", 0) + 1
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(by.items(), key=lambda t: -t[1]))
+        print(f"change report: {len(rows)} rows -> imports/category_changes.csv | {detail}")
+    except Exception as e:
+        print(f"change report: skipped ({e})")
+
+
+def strip_internals(all_rows):
+    """Drop the _before_* scratch keys. push_csv/publish_json use
+    extrasaction='ignore' and an APP_COLUMNS whitelist so they would never leak,
+    but leaving them out of the row dicts entirely is one less thing to trust."""
+    for r in all_rows:
+        r.pop("_before_cat", None)
+        r.pop("_before_src", None)
+
+
 def main():
     new_rows, quarantine = fetch_import()
     existing, sha = fetch_github_csv()
@@ -1381,10 +1809,20 @@ def main():
     # Must run AFTER geocode (needs venue coords) and BEFORE publish/push, so the
     # local wall clock is what lands in events.json and the CSV.
     localize_times(all_rows)
-    # Recompute categories across the whole set so old rows heal too, then
-    # recover artist-name-only concerts via MusicBrainz (cached, capped).
+    # Category chain, cheapest and most certain first. Each pass only ever
+    # touches rows the previous one honestly left as "Event", so a later pass
+    # can never overwrite a confident earlier answer:
+    #   1. keywords    - free, deterministic, refuses rather than guess
+    #   2. AI          - cheap, knows who performers actually are
+    #   3. MusicBrainz - free, authoritative on acts the AI did not know
     recategorize_all(all_rows)
+    _, ai_dropped = ai_categorize(all_rows)
     enrich_artists(all_rows)
+    if ai_dropped:
+        drop_ids = {id(r) for r in ai_dropped}
+        all_rows = [r for r in all_rows if id(r) not in drop_ids]
+    write_change_report(all_rows, ai_dropped)
+    strip_internals(all_rows)
     upcoming = publish_json(all_rows)
     push_csv(all_rows, sha)
     update_domain_stats(new_rows, quarantine, {id(r) for r in all_rows})
