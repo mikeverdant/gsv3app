@@ -1532,16 +1532,35 @@ def _loose(s):
 
 _SQUASH = lambda s: _loose(s).replace(" ", "")
 
+# Everything after one of these is decoration: a tour name, the support acts,
+# the venue or the city. The part BEFORE it is who is actually playing.
+_DECOR_RE = re.compile(
+    r"\s+(?:-|–|—|\||:|with|w/|at|in|featuring|ft\.?|feat\.?|presents?)\s+|,\s+", re.I)
+
+def _headliner(name):
+    """The act, stripped of decoration. Two sources describe one night as
+    "Interpol at Warfield" and "Interpol, julie in San Francisco": neither
+    contains the other and they share one word, so both tests below miss them.
+    What they agree on is who is playing."""
+    return _SQUASH(_DECOR_RE.split(str(name or ""), 1)[0])
+
 def _same_name(a, b):
-    """Same event? One title containing the other counts, and so does sharing
-    most of the words: titles gain and lose support acts, tour names and
-    sponsors between sources while staying the same night."""
+    """Same event? Three tests, cheapest first:
+    1. one title contains the other ("Wunderhorse" / "Wunderhorse Tour 2026")
+    2. they share most of their words
+    3. they name the same headliner once decoration is stripped
+    Titles gain and lose support acts, tour names, venues and cities between
+    sources while staying the same night."""
     sa, sb = _SQUASH(a), _SQUASH(b)
     if not sa or not sb: return False
     if sa == sb or sa in sb or sb in sa: return True
     ta, tb = set(_loose(a).split()), set(_loose(b).split())
     shared = len(ta & tb); smaller = min(len(ta), len(tb))
-    return smaller >= 2 and shared / smaller >= 0.7
+    if smaller >= 2 and shared / smaller >= 0.7: return True
+    # Require a substantial headliner: a 2-3 character fragment would collide
+    # on common words and fold unrelated events together.
+    ha, hb = _headliner(a), _headliner(b)
+    return len(ha) >= 4 and ha == hb
 
 def _same_venue(a, b):
     """Same place? "The Noshpit" and "The Noshpit Sandwich Bar" are one venue.
