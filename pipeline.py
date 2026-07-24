@@ -1510,6 +1510,7 @@ def _dedup_name(s):
 # two real events that must both survive.
 
 _TIME_RE = re.compile(r"^(\d{1,2})(?::(\d{2}))?\s*([ap])", re.I)
+_DECOR_LEAD_RE = re.compile(r"^(?:the|a)\s+", re.I)
 
 def _minutes(t):
     """Start time in minutes past midnight, or None. Handles 21:00 and 9:00 PM."""
@@ -1562,11 +1563,23 @@ def _same_name(a, b):
     ha, hb = _headliner(a), _headliner(b)
     return len(ha) >= 4 and ha == hb
 
+_VENUE_TAIL_RE = re.compile(r"\s+(?:-|–|—|\||,)\s*.*$")
+
+def _venue_key(v):
+    """A venue name reduced to the part that identifies the place.
+    Sources write one venue as "The Neptune Theatre", "Neptune Theatre - WA"
+    and "Neptune Theatre, Seattle". A leading article and a trailing state or
+    city break plain containment, so both are stripped before comparing."""
+    s = _DECOR_LEAD_RE.sub("", str(v or "").strip())
+    s = _VENUE_TAIL_RE.sub("", s)
+    return _SQUASH(s)
+
 def _same_venue(a, b):
-    """Same place? "The Noshpit" and "The Noshpit Sandwich Bar" are one venue.
-    Without this, one venue spelled two ways reads as two locations and the
-    same night survives twice."""
-    sa, sb = _SQUASH(a), _SQUASH(b)
+    """Same place? "The Noshpit" and "The Noshpit Sandwich Bar" are one venue,
+    and so are "The Neptune Theatre" and "Neptune Theatre - WA". Without this,
+    one venue spelled two ways reads as two locations and the same night
+    survives two, three, four times."""
+    sa, sb = _venue_key(a), _venue_key(b)
     if not sa or not sb: return False
     return sa == sb or sa in sb or sb in sa
 
