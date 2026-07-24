@@ -713,24 +713,30 @@ def ai_categorize(all_rows):
             if o: cache[_ai_key(r)] = o
 
     # Apply the cache to every matching row, including ones we did not send.
-    resolved, not_event = 0, []
+    resolved, flagged = 0, []
     for r in all_rows:
         if (r.get("category") or "").strip() != "Event":
             continue
         o = cache.get(_ai_key(r))
         if not o: continue
-        # Only delete on POSITIVE evidence. A real touring artist was deleted in
-        # testing because his row was empty and the model guessed. Missing data
-        # is not merchandise, so a "guess" can never remove an event.
-        if not o.get("is_event", True) and str(o.get("basis")) == "stated_in_text":
-            not_event.append(r); continue
+        if not o.get("is_event", True):
+            # ADVISORY ONLY. The model is never allowed to remove an event.
+            # It called real film screenings, festivals with "Tickets" in the
+            # title, and a library craft session "not events". Deletion is the
+            # one irreversible thing here and the one nobody can audit after
+            # the fact, so it is not a judgement call we delegate. The row is
+            # written to imports/ai_not_events.csv for a human to look at and
+            # otherwise left completely alone.
+            flagged.append(r)
+            continue
         if apply(r, o): resolved += 1
 
     _save_json_map(AI_CACHE_NAME, cache)
     guesses = sum(1 for v in cache.values() if str(v.get("basis")) == "guess")
     print(f"ai: {calls} calls, {len(queue)} sent, {resolved} labeled, "
-          f"{len(not_event)} not-events, {len(cache)} cached ({guesses} honest guesses)")
-    return resolved, not_event
+          f"{len(flagged)} flagged for review (not deleted), "
+          f"{len(cache)} cached ({guesses} honest guesses)")
+    return resolved, flagged
 
 
 # ---------- MusicBrainz artist lookup (free, no key, 1 req/sec) ----------
@@ -1742,7 +1748,28 @@ def push_csv(all_rows, sha):
     p.raise_for_status()
     print(f"Pushed CSV: {len(all_rows)} rows.")
 
-def write_change_report(all_rows, dropped_rows):
+def write_flagged_report(flagged_rows):
+    """Rows the AI thinks are not events. Advisory: nothing was removed.
+
+    Read imports/ai_not_events.csv, and if something in it is genuinely not an
+    event, add the pattern to MERCH_RE where the rule is explicit and testable.
+    Best-effort; a failure here must never affect the data."""
+    try:
+        cols = ["date", "event_name", "venue", "category", "url"]
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for r in flagged_rows:
+            w.writerow({c: r.get(c, "") for c in cols})
+        requests.post(f"{SUPABASE_URL}/storage/v1/object/{IMPORTS_BUCKET}/ai_not_events.csv",
+                      headers={**SB, "Content-Type": "text/csv", "x-upsert": "true"},
+                      data=buf.getvalue().encode())
+        print(f"flagged report: {len(flagged_rows)} rows -> imports/ai_not_events.csv (none deleted)")
+    except Exception as e:
+        print(f"flagged report: skipped ({e})")
+
+
+def write_change_report(all_rows):
     """Every category change this run, with WHO made it, as a CSV in storage.
 
     Mike cannot read the code, so he must never be asked to diagnose it. When a
@@ -1765,13 +1792,6 @@ def write_change_report(all_rows, dropped_rows):
                 "secondary": r.get("category_secondary", ""),
                 "decided_by": r.get("category_source", ""),
                 "was_decided_by": r.get("_before_src", ""),
-            })
-        for r in dropped_rows:
-            rows.append({
-                "date": r.get("date", ""), "event_name": r.get("event_name", ""),
-                "venue": r.get("venue", ""), "was": r.get("_before_cat", ""),
-                "now": "DROPPED-not-an-event", "secondary": "",
-                "decided_by": "ai:v1", "was_decided_by": r.get("_before_src", ""),
             })
         cols = ["date","event_name","venue","was","now","secondary","decided_by","was_decided_by"]
         buf = io.StringIO()
@@ -1816,12 +1836,12 @@ def main():
     #   2. AI          - cheap, knows who performers actually are
     #   3. MusicBrainz - free, authoritative on acts the AI did not know
     recategorize_all(all_rows)
-    _, ai_dropped = ai_categorize(all_rows)
+    _, ai_flagged = ai_categorize(all_rows)
     enrich_artists(all_rows)
-    if ai_dropped:
-        drop_ids = {id(r) for r in ai_dropped}
-        all_rows = [r for r in all_rows if id(r) not in drop_ids]
-    write_change_report(all_rows, ai_dropped)
+    # NOTE: ai_flagged rows are NOT removed. Nothing the model says can delete
+    # an event. The list is written out for a human to review.
+    write_flagged_report(ai_flagged)
+    write_change_report(all_rows)
     strip_internals(all_rows)
     upcoming = publish_json(all_rows)
     push_csv(all_rows, sha)
