@@ -162,6 +162,39 @@ def _in_us(lat, lng):
     return (_in_bbox(lat, lng, (24.4, 49.4, -125.0, -66.9))
             or _in_bbox(lat, lng, STATE_BBOX["AK"]) or _in_bbox(lat, lng, STATE_BBOX["HI"]))
 
+# ─── SAFETY GEO-BLOCK ────────────────────────────────────────────────────────
+# MIRROR of the app's data/events.ts BLOCKED_AREAS. Events physically inside these
+# areas must never be written to events.json, so they can never reach the public
+# map (surfacing them could help target people, e.g. Ukraine). We still INGEST
+# them; this only strips them from the PUBLISHED feed. Keep this list identical to
+# the app's so database, feed, and app all agree.
+BLOCKED_AREAS = [
+    {
+        "name": "Ukraine",
+        "box": (43.9, 52.6, 21.9, 40.4),  # (minLat, maxLat, minLng, maxLng)
+        "tokens": ["ukraine", "ukrainian", "\u0443\u043a\u0440\u0430\u0457\u043d\u0430",
+                   "kyiv", "kiev", "kharkiv", "lviv", "dnipro", "mariupol", "zaporizhzhia"],
+    },
+]
+
+def is_blocked_area(r):
+    """True when a row falls inside any blocked area. Never publish these.
+    Coordinates are the reliable signal; a name-text match is the fallback for
+    rows missing coordinates. Mirrors isBlockedArea() in the app."""
+    try:
+        lat = float((r.get("venue_lat") or "").strip())
+        lng = float((r.get("venue_lng") or "").strip())
+        has_coords = not (lat == 0 and lng == 0)
+    except (TypeError, ValueError):
+        has_coords, lat, lng = False, 0.0, 0.0
+    text = (str(r.get("region") or "") + " " + str(r.get("venue_address") or "")).lower()
+    for a in BLOCKED_AREAS:
+        if has_coords and _in_bbox(lat, lng, a["box"]):
+            return True
+        if any(t in text for t in a["tokens"]):
+            return True
+    return False
+
 def coords_contradict_text(lat, lng, text):
     """True only when coordinates PROVABLY contradict the location text.
     Weak (abbrev-only) evidence counts only for pins inside the US, so foreign
@@ -1857,7 +1890,9 @@ def geocode(all_rows, cache, cmap):
 
 def publish_json(all_rows):
     today = date.today().isoformat()
-    upcoming = sorted([r for r in all_rows if (r.get("date") or "") >= today],
+    fresh = [r for r in all_rows if (r.get("date") or "") >= today]
+    blocked = [r for r in fresh if is_blocked_area(r)]
+    upcoming = sorted([r for r in fresh if not is_blocked_area(r)],
                       key=lambda r: (r.get("date",""), r.get("start_time","")))
     payload = json.dumps([{c: (r.get(c) or "") for c in APP_COLUMNS} for r in upcoming],
                          ensure_ascii=False, separators=(",", ":")).encode()
@@ -1867,7 +1902,7 @@ def publish_json(all_rows):
         u = requests.put(f"{SUPABASE_URL}/storage/v1/object/{EVENTS_BUCKET}/{JSON_NAME}",
                          headers={**SB, "Content-Type": "application/json", "x-upsert": "true"}, data=payload)
     u.raise_for_status()
-    print(f"events.json: {len(upcoming)} upcoming, {len(payload)/1e6:.1f} MB uploaded.")
+    print(f"events.json: {len(upcoming)} upcoming, {len(payload)/1e6:.1f} MB uploaded. ({len(blocked)} blocked-area rows withheld)")
     return len(upcoming)
 
 def push_csv(all_rows, sha):
