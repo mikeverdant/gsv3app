@@ -1493,6 +1493,109 @@ def _dedup_name(s):
         toks.pop()
     return "".join(toks)
 
+# ---------- Same-event matching ----------
+#
+# Mike's rule, in code: same day + same location + a similar or near-exact name
+# means it is the SAME EVENT. Exact-key dedup only catches identical strings, so
+# "Wunderhorse" and "Wunderhorse - North America 2026 Been Stellar" at the same
+# venue on the same night both survived, and a listing fills up with near-copies
+# of one show.
+#
+# Times are deliberately NOT part of the identity test, only a sanity check.
+# Measured across the live catalogue: of 1,023 same-day/same-venue/similar-name
+# pairs, 302 shared an exact start time, 635 were within 90 minutes, and only 86
+# were more than three hours apart. That gap is the signal. Under 90 minutes is
+# two sources disagreeing about door time versus set time. Hours apart is a
+# genuine second showing (a matinee and an evening performance), and those are
+# two real events that must both survive.
+
+_TIME_RE = re.compile(r"^(\d{1,2})(?::(\d{2}))?\s*([ap])", re.I)
+
+def _minutes(t):
+    """Start time in minutes past midnight, or None. Handles 21:00 and 9:00 PM."""
+    s = str(t or "").strip()
+    if not s: return None
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*([ap])?", s, re.I)
+    if not m: return None
+    h = int(m.group(1)); mi = int(m.group(2) or 0); ap = (m.group(3) or "").lower()
+    if ap == "p" and h < 12: h += 12
+    if ap == "a" and h == 12: h = 0
+    return h * 60 + mi if h <= 23 and mi <= 59 else None
+
+def _loose(s):
+    """One normaliser for every text comparison, so nothing compares raw
+    strings. Curly quotes, "&" vs "and", "w/" vs "with" and punctuation all
+    collapse to the same form."""
+    s = unicodedata.normalize("NFKD", str(s or "")).lower()
+    s = s.replace("&", " and ").replace("w/", " with ")
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+_SQUASH = lambda s: _loose(s).replace(" ", "")
+
+def _same_name(a, b):
+    """Same event? One title containing the other counts, and so does sharing
+    most of the words: titles gain and lose support acts, tour names and
+    sponsors between sources while staying the same night."""
+    sa, sb = _SQUASH(a), _SQUASH(b)
+    if not sa or not sb: return False
+    if sa == sb or sa in sb or sb in sa: return True
+    ta, tb = set(_loose(a).split()), set(_loose(b).split())
+    shared = len(ta & tb); smaller = min(len(ta), len(tb))
+    return smaller >= 2 and shared / smaller >= 0.7
+
+def _same_venue(a, b):
+    """Same place? "The Noshpit" and "The Noshpit Sandwich Bar" are one venue.
+    Without this, one venue spelled two ways reads as two locations and the
+    same night survives twice."""
+    sa, sb = _SQUASH(a), _SQUASH(b)
+    if not sa or not sb: return False
+    return sa == sb or sa in sb or sb in sa
+
+def _venue_bucket(v):
+    """Cheap grouping key so the pairwise check only runs on plausible pairs.
+    Correctness still comes from _same_venue; this is purely an optimisation."""
+    toks = [t for t in _loose(v).split() if t not in {"the", "a", "at"}]
+    return toks[0] if toks else ""
+
+SAME_SHOW_MINUTES = 90
+
+def fuzzy_dedup(rows):
+    """Second dedup pass: collapse same-day, same-venue, same-event rows that
+    the exact-key pass could not see. Keeps the most complete row and backfills
+    its blanks from the copy, so nothing is lost by folding."""
+    buckets = {}
+    for r in rows:
+        buckets.setdefault((r.get("date", "").strip(), _venue_bucket(r.get("venue"))), []).append(r)
+
+    drop = set()
+    folded = 0
+    for (date, vb), group in buckets.items():
+        if not date or not vb or len(group) < 2: continue
+        for i in range(len(group)):
+            a = group[i]
+            if id(a) in drop: continue
+            for j in range(i + 1, len(group)):
+                b = group[j]
+                if id(b) in drop: continue
+                if not _same_venue(a.get("venue"), b.get("venue")): continue
+                if not _same_name(a.get("event_name"), b.get("event_name")): continue
+                ta, tb = _minutes(a.get("start_time")), _minutes(b.get("start_time"))
+                # A blank time cannot prove these are separate showings, so it
+                # folds. Hours apart is a real second showing: leave both.
+                if ta is not None and tb is not None and abs(ta - tb) > SAME_SHOW_MINUTES:
+                    continue
+                keep, lose = (a, b) if filled_count(a) >= filled_count(b) else (b, a)
+                for c in APP_COLUMNS:
+                    if not (keep.get(c) or "").strip() and (lose.get(c) or "").strip():
+                        keep[c] = lose[c]
+                drop.add(id(lose))
+                folded += 1
+                if lose is a: break
+    out = [r for r in rows if id(r) not in drop]
+    print(f"Same-event fold: {folded} near-duplicate rows merged ({len(out)} remain).")
+    return out
+
+
 def dedup(existing, new):
     key = lambda r: (r.get("date","").strip(), r.get("start_time","").strip(), _dedup_name(r.get("event_name")))
     merged, internal, dropped = {}, 0, 0
@@ -1516,6 +1619,7 @@ def dedup(existing, new):
             merged[k] = r
     rows = list(merged.values())
     print(f"Merged: {len(rows)} unique ({dropped} import dupes folded, {internal} internal cleaned).")
+    rows = fuzzy_dedup(rows)
     return rows, dropped
 
 def load_cache():
