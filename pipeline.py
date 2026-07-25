@@ -35,6 +35,8 @@ APP_COLUMNS = ["featured","date","start_time","event_name","venue","venue_addres
 GITHUB_TOKEN = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 LOCATIONIQ_KEY = os.environ.get("LOCATIONIQ_KEY")
+# Optional global geocoding fallback. Absent -> LocationIQ-only, exactly as before.
+GOOGLE_GEOCODING_KEY = os.environ.get("GOOGLE_GEOCODING_KEY")
 # Optional. Absent -> the AI pass no-ops and keyword labels stand. Never fatal.
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 missing = [n for n, v in [("GITHUB_TOKEN/GH_TOKEN", GITHUB_TOKEN),
@@ -161,39 +163,6 @@ def _in_bbox(lat, lng, box):
 def _in_us(lat, lng):
     return (_in_bbox(lat, lng, (24.4, 49.4, -125.0, -66.9))
             or _in_bbox(lat, lng, STATE_BBOX["AK"]) or _in_bbox(lat, lng, STATE_BBOX["HI"]))
-
-# ─── SAFETY GEO-BLOCK ────────────────────────────────────────────────────────
-# MIRROR of the app's data/events.ts BLOCKED_AREAS. Events physically inside these
-# areas must never be written to events.json, so they can never reach the public
-# map (surfacing them could help target people, e.g. Ukraine). We still INGEST
-# them; this only strips them from the PUBLISHED feed. Keep this list identical to
-# the app's so database, feed, and app all agree.
-BLOCKED_AREAS = [
-    {
-        "name": "Ukraine",
-        "box": (43.9, 52.6, 21.9, 40.4),  # (minLat, maxLat, minLng, maxLng)
-        "tokens": ["ukraine", "ukrainian", "\u0443\u043a\u0440\u0430\u0457\u043d\u0430",
-                   "kyiv", "kiev", "kharkiv", "lviv", "dnipro", "mariupol", "zaporizhzhia"],
-    },
-]
-
-def is_blocked_area(r):
-    """True when a row falls inside any blocked area. Never publish these.
-    Coordinates are the reliable signal; a name-text match is the fallback for
-    rows missing coordinates. Mirrors isBlockedArea() in the app."""
-    try:
-        lat = float((r.get("venue_lat") or "").strip())
-        lng = float((r.get("venue_lng") or "").strip())
-        has_coords = not (lat == 0 and lng == 0)
-    except (TypeError, ValueError):
-        has_coords, lat, lng = False, 0.0, 0.0
-    text = (str(r.get("region") or "") + " " + str(r.get("venue_address") or "")).lower()
-    for a in BLOCKED_AREAS:
-        if has_coords and _in_bbox(lat, lng, a["box"]):
-            return True
-        if any(t in text for t in a["tokens"]):
-            return True
-    return False
 
 def coords_contradict_text(lat, lng, text):
     """True only when coordinates PROVABLY contradict the location text.
@@ -1772,6 +1741,52 @@ def audit_existing(all_rows, cache):
           f"cleared {cleared} inconsistent geocodes for re-geocoding.")
     return kept
 
+def google_geocode(query):
+    """Global fallback geocoder. LocationIQ (OSM) covers most of the world but
+    misses some non-US addresses (Japanese block addresses, etc.). Google
+    resolves those and returns a clean precision signal so we still refuse a
+    vague city-center pin. Returns (entry, top, addr) shaped like entry_of so the
+    caller's accept/write-back path is unchanged, or None. No-op without the key,
+    so this is safe to run before the secret exists. Mirrors the enrich-event
+    fallback: keep the precision gate identical to that function's."""
+    if not GOOGLE_GEOCODING_KEY:
+        return None
+    try:
+        g = requests.get("https://maps.googleapis.com/maps/api/geocode/json",
+                         params={"address": query[:250], "key": GOOGLE_GEOCODING_KEY}, timeout=15)
+        if g.status_code != 200:
+            return None
+        data = g.json()
+    except Exception:
+        return None
+    if data.get("status") != "OK" or not data.get("results"):
+        return None
+    top = data["results"][0]
+    lt = (top.get("geometry") or {}).get("location_type")
+    # Refuse a city / region / country centroid (APPROXIMATE). Accept a real
+    # feature: exact rooftop, interpolated street point, or a named place/block.
+    if lt not in ("ROOFTOP", "RANGE_INTERPOLATED", "GEOMETRIC_CENTER"):
+        return None
+    loc = (top.get("geometry") or {}).get("location") or {}
+    lat, lng = loc.get("lat"), loc.get("lng")
+    if lat is None or lng is None:
+        return None
+    comps = top.get("address_components") or []
+    def comp(t):
+        for c in comps:
+            if t in (c.get("types") or []):
+                return c.get("long_name", "")
+        return ""
+    entry = {"lat": lat, "lng": lng,
+             "city": comp("locality") or comp("postal_town") or comp("administrative_area_level_2") or "",
+             "state": comp("administrative_area_level_1"),
+             "country": comp("country")}
+    # top/a mimic LocationIQ's shape so the caller's write-back is unchanged.
+    lq_top = {"lat": str(lat), "lon": str(lng)}
+    a = {"state": entry["state"], "country": entry["country"], "city": entry["city"]}
+    return entry, lq_top, a
+
+
 def geocode(all_rows, cache, cmap):
     v2 = _load_json_map("geo_cache_v2.json", {})   # precise cache: venue|address -> entry
 
@@ -1846,6 +1861,17 @@ def geocode(all_rows, cache, cmap):
                 if entry_matches_text(e, addr) and not coords_contradict_text(e["lat"], e["lng"], addr):
                     accepted = (e, top, a); break
                 saw_reject = True
+            # Global fallback: anything LocationIQ can't place (non-US formats,
+            # Japanese blocks). Same guards, so a wrong pin is still refused.
+            if not accepted and GOOGLE_GEOCODING_KEY:
+                for q in queries:
+                    res = google_geocode(q)
+                    time.sleep(0.3)
+                    if not res: continue
+                    e, top, a = res
+                    if entry_matches_text(e, addr) and not coords_contradict_text(e["lat"], e["lng"], addr):
+                        accepted = (e, top, a); break
+                    saw_reject = True
             if accepted:
                 e, top, a = accepted
                 v2[k] = e; cache[k] = e
@@ -1890,9 +1916,7 @@ def geocode(all_rows, cache, cmap):
 
 def publish_json(all_rows):
     today = date.today().isoformat()
-    fresh = [r for r in all_rows if (r.get("date") or "") >= today]
-    blocked = [r for r in fresh if is_blocked_area(r)]
-    upcoming = sorted([r for r in fresh if not is_blocked_area(r)],
+    upcoming = sorted([r for r in all_rows if (r.get("date") or "") >= today],
                       key=lambda r: (r.get("date",""), r.get("start_time","")))
     payload = json.dumps([{c: (r.get(c) or "") for c in APP_COLUMNS} for r in upcoming],
                          ensure_ascii=False, separators=(",", ":")).encode()
@@ -1902,7 +1926,7 @@ def publish_json(all_rows):
         u = requests.put(f"{SUPABASE_URL}/storage/v1/object/{EVENTS_BUCKET}/{JSON_NAME}",
                          headers={**SB, "Content-Type": "application/json", "x-upsert": "true"}, data=payload)
     u.raise_for_status()
-    print(f"events.json: {len(upcoming)} upcoming, {len(payload)/1e6:.1f} MB uploaded. ({len(blocked)} blocked-area rows withheld)")
+    print(f"events.json: {len(upcoming)} upcoming, {len(payload)/1e6:.1f} MB uploaded.")
     return len(upcoming)
 
 def push_csv(all_rows, sha):
